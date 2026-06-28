@@ -215,10 +215,18 @@ class EvictionConfig:
     """ The eviction policy to use. """
 
     trigger_watermark: float = field(default=0.8)
-    """ The memory usage watermark to trigger eviction (0.0 to 1.0). """
+    """ The high watermark that triggers eviction (0.0 to 1.0). """
+
+    target_watermark: float = field(default=0.0)
+    """ Low watermark of the eviction hysteresis band (0.0 to 1.0). When > 0.0
+    (and < trigger_watermark), a triggered sweep evicts down to
+    target_watermark in one pass instead of a fixed eviction_ratio, so headroom
+    always exists and eviction can't fall behind a sustained write burst. 0.0
+    (default) keeps the legacy fixed-ratio behaviour. """
 
     eviction_ratio: float = field(default=0.2)
-    """ The fraction of *allocated* memory to evict when triggered (0.0 to 1.0). """
+    """ The fraction of *allocated* memory to evict when triggered (0.0 to 1.0).
+    Used only when target_watermark is 0.0 (legacy fixed-ratio mode). """
 
 
 @dataclass
@@ -455,8 +463,17 @@ def add_storage_manager_args(
         "--eviction-trigger-watermark",
         type=float,
         default=0.8,
-        help="The memory usage watermark to trigger eviction (0.0 to 1.0). "
+        help="The high watermark that triggers eviction (0.0 to 1.0). "
         "Default is 0.8.",
+    )
+    eviction_group.add_argument(
+        "--eviction-target-watermark",
+        type=float,
+        default=0.0,
+        help="Low watermark of the eviction hysteresis band (0.0 to 1.0). When "
+        ">0 and < trigger watermark, a sweep evicts down to this in one pass so "
+        "eviction can't fall behind a sustained write burst. 0.0 (default) keeps "
+        "the legacy fixed-ratio behaviour.",
     )
     eviction_group.add_argument(
         "--eviction-ratio",
@@ -587,6 +604,7 @@ def parse_args_to_config(
     eviction_config = EvictionConfig(
         eviction_policy=args.eviction_policy,
         trigger_watermark=args.eviction_trigger_watermark,
+        target_watermark=args.eviction_target_watermark,
         eviction_ratio=args.eviction_ratio,
     )
 
