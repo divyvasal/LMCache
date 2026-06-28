@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Optional
 from urllib.parse import quote as url_quote
 from urllib.parse import urlencode
 import asyncio
+import base64
 import ctypes
+import hashlib
 import threading
 import xml.etree.ElementTree as ET
 
@@ -189,6 +191,53 @@ def _object_key_to_string(key: ObjectKey) -> str:
     if key.cache_salt:
         return f"{base}@{key.cache_salt}"
     return base
+
+
+# S3 ``DeleteObjects`` (multi-object delete) caps each request at 1000 keys.
+DELETE_OBJECTS_MAX_KEYS = 1000
+
+
+def _build_delete_objects_body(key_strs: list[str]) -> bytes:
+    """Build the XML body for an S3 ``DeleteObjects`` (multi-delete) request.
+
+    Uses ``Quiet`` mode so the response only carries entries that *failed*
+    (successful deletes are omitted), keeping the parse cheap. ElementTree
+    handles XML-escaping of object keys.
+    """
+    root = ET.Element("Delete")
+    ET.SubElement(root, "Quiet").text = "true"
+    for key_str in key_strs:
+        obj = ET.SubElement(root, "Object")
+        ET.SubElement(obj, "Key").text = key_str
+    return ET.tostring(root, encoding="utf-8")
+
+
+def _parse_delete_objects_errors(body: bytes) -> set[str]:
+    """Parse a ``DeleteObjects`` (Quiet-mode) response into the set of keys
+    that failed to delete.
+
+    In Quiet mode the response contains only ``<Error>`` elements; an empty
+    or whitespace-only body means every key deleted. Returns the failed
+    ``<Key>`` strings so the caller can drop them from its success accounting.
+
+    Raises:
+        ValueError: the response body is present but not valid XML.
+    """
+    if not body or not body.strip():
+        return set()
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise ValueError(f"malformed DeleteObjects XML: {exc}") from None
+    errored: set[str] = set()
+    # Match by local tag name so the S3 default namespace doesn't matter.
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] != "Error":
+            continue
+        for child in elem:
+            if child.tag.rsplit("}", 1)[-1] == "Key" and child.text:
+                errored.add(child.text)
+    return errored
 
 
 def _format_safe_path(key_str: str) -> str:
@@ -927,32 +976,58 @@ class S3L2Adapter(L2AdapterInterface):
         )
         return s3_req
 
-    def _delete_request(self, key_str: str):
-        req = self._make_request("DELETE", key_str)
-        captured = {"status": None}
+    def _delete_many_request(self, key_strs: list[str]):
+        """Build a single S3 ``DeleteObjects`` (multi-delete) request for up to
+        ``DELETE_OBJECTS_MAX_KEYS`` keys — one round trip instead of one per key.
+
+        Returns ``(s3_req, body_chunks, captured)``; the caller awaits
+        ``s3_req.finished_future`` and passes ``body_chunks`` to
+        :func:`_parse_delete_objects_errors` to find any per-key failures.
+        """
+        body = _build_delete_objects_body(key_strs)
+        # S3 DeleteObjects requires a Content-MD5 of the body (integrity, not
+        # security — SigV4 already authenticates the request).
+        content_md5 = base64.b64encode(
+            hashlib.md5(body, usedforsecurity=False).digest()
+        ).decode("ascii")
+        headers = HttpHeaders()
+        headers.add("Host", self._endpoint)
+        headers.add("Content-MD5", content_md5)
+        headers.add("Content-Length", str(len(body)))
+        headers.add("Content-Type", "application/xml")
+        # The ``?delete`` subresource selects the multi-object delete operation.
+        req = HttpRequest("POST", "/?delete", headers, body_stream=MemoryViewStream(body))
+
+        body_chunks: list[bytes] = []
+        captured: dict[str, Optional[int]] = {"status": None}
+
+        def on_body(chunk, offset, **kwargs):
+            body_chunks.append(bytes(chunk))
 
         def on_headers(status_code, headers, **kwargs):
             captured["status"] = status_code
 
         def on_done(error=None, status_code=None, **kwargs):
             captured["status"] = status_code or captured["status"]
-            # 204 is standard for DeleteObject, 200 also tolerated.
-            if error or captured["status"] not in (200, 204):
+            # DeleteObjects returns 200 even when individual keys fail; per-key
+            # errors are reported in the body and handled by the caller.
+            if error or captured["status"] != 200:
                 raise RuntimeError(
-                    f"S3 DELETE failed for {key_str}: {error or captured['status']}"
+                    f"S3 DeleteObjects failed: {error or captured['status']}"
                 )
 
         s3_req = s3.S3Request(
             client=self._s3_client,
             type=s3.S3RequestType.DEFAULT,
             request=req,
-            operation_name="DeleteObject",
+            operation_name="DeleteObjects",
+            on_body=on_body,
             on_headers=on_headers,
             on_done=on_done,
             credential_provider=self._credentials_provider,
             region=self._region,
         )
-        return s3_req
+        return s3_req, body_chunks, captured
 
     def _list_request(
         self,
@@ -1246,38 +1321,61 @@ class S3L2Adapter(L2AdapterInterface):
     async def _execute_delete(
         self, keys: list[ObjectKey]
     ) -> tuple[list[ObjectKey], list[int]]:
-        """Run DELETE for each key and drop its size-tracking entry.
+        """Bulk-delete keys via S3 ``DeleteObjects`` (≤1000 keys/request) and
+        drop their size-tracking entries.
 
-        Returns parallel lists of successfully deleted keys and their
-        stored sizes, suitable for passing straight to
-        ``_notify_keys_deleted``. Keys whose size we never learned
-        (delete of an unknown key) are reported with size ``0`` so
-        listener fanout still fires while base-class byte accounting
-        stays balanced.
+        Batching into multi-object deletes means eviction issues one S3 round
+        trip per 1000 keys instead of one per key — so the evictor can keep up
+        with a high-concurrency write burst instead of falling behind (and
+        pinning usage at the cap). Returns parallel lists of successfully
+        deleted keys and their stored sizes, suitable for passing straight to
+        ``_notify_keys_deleted``. Keys whose size we never learned are reported
+        with size ``0`` so listener fanout still fires while base-class byte
+        accounting stays balanced.
         """
+        # Build one DeleteObjects request per batch of up to 1000 keys.
+        batches: list[tuple[list[ObjectKey], list[str], list[bytes]]] = []
         futures = []
-        indexed = []
-        for key in keys:
+        for i in range(0, len(keys), DELETE_OBJECTS_MAX_KEYS):
+            batch = keys[i : i + DELETE_OBJECTS_MAX_KEYS]
+            key_strs = [_object_key_to_string(k) for k in batch]
             try:
-                key_str = _object_key_to_string(key)
-                s3_req = self._delete_request(key_str)
+                s3_req, body_chunks, _captured = self._delete_many_request(key_strs)
                 futures.append(asyncio.wrap_future(s3_req.finished_future))
-                indexed.append((key, key_str))
+                batches.append((batch, key_strs, body_chunks))
             except Exception:
-                logger.exception("S3L2Adapter failed to launch DELETE")
+                logger.exception("S3L2Adapter failed to launch DeleteObjects")
+                futures.append(None)
+                batches.append((batch, key_strs, []))
 
-        results = await asyncio.gather(*futures, return_exceptions=True)
+        results = await asyncio.gather(
+            *[f for f in futures if f is not None], return_exceptions=True
+        )
+        result_iter = iter(results)
+
         deleted_keys: list[ObjectKey] = []
         deleted_sizes: list[int] = []
-        for (key, key_str), result in zip(indexed, results, strict=True):
-            if isinstance(result, Exception):
-                logger.warning("S3L2Adapter DELETE failed for %s: %s", key_str, result)
+        for (batch, key_strs, body_chunks), fut in zip(batches, futures, strict=True):
+            if fut is None:
                 continue
-            with self._lock:
-                sz = self._key_sizes.pop(key, None)
-                self._object_size_cache.pop(key_str, None)
-            deleted_keys.append(key)
-            deleted_sizes.append(sz if sz is not None else 0)
+            result = next(result_iter)
+            if isinstance(result, Exception):
+                logger.warning("S3L2Adapter DeleteObjects batch failed: %s", result)
+                continue
+            try:
+                errored = _parse_delete_objects_errors(b"".join(body_chunks))
+            except ValueError as e:
+                logger.warning("S3L2Adapter DeleteObjects response parse failed: %s", e)
+                continue
+            for key, key_str in zip(batch, key_strs):
+                if key_str in errored:
+                    logger.warning("S3L2Adapter DELETE failed for %s", key_str)
+                    continue
+                with self._lock:
+                    sz = self._key_sizes.pop(key, None)
+                    self._object_size_cache.pop(key_str, None)
+                deleted_keys.append(key)
+                deleted_sizes.append(sz if sz is not None else 0)
         return deleted_keys, deleted_sizes
 
 

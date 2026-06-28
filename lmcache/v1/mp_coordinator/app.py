@@ -82,6 +82,7 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
         usage_manager=usage_manager,
         eviction_ratio=config.eviction_ratio,
         trigger_watermark=config.trigger_watermark,
+        target_watermark=config.target_watermark,
     )
     resync_manager = L2ResyncManager(
         usage_manager=usage_manager,

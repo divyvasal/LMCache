@@ -23,7 +23,9 @@ from lmcache.v1.distributed.l2_adapters import s3_l2_adapter as s3mod
 from lmcache.v1.distributed.l2_adapters.s3_l2_adapter import (
     S3L2Adapter,
     S3L2AdapterConfig,
+    _build_delete_objects_body,
     _object_key_to_string,
+    _parse_delete_objects_errors,
 )
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -100,6 +102,21 @@ def _path_to_key(path: str) -> str:
     from urllib.parse import unquote
 
     return unquote(path.lstrip("/"))
+
+
+def _parse_delete_request_keys(xml: bytes) -> list[str]:
+    """Extract ``<Object><Key>`` strings from a DeleteObjects request body."""
+    # Standard
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml)
+    return [
+        key.text
+        for obj in root
+        if obj.tag.rsplit("}", 1)[-1] == "Object"
+        for key in obj
+        if key.tag.rsplit("}", 1)[-1] == "Key" and key.text
+    ]
 
 
 def _build_list_objects_v2_response(
@@ -199,6 +216,40 @@ class _FakeS3Request:
                     on_headers(200, [("content-type", "application/xml")])
                 if on_body is not None:
                     on_body(xml, 0)
+                if on_done is not None:
+                    on_done(error=None, status_code=200)
+                self.finished_future.set_result(None)
+            except Exception as e:
+                if not self.finished_future.done():
+                    self.finished_future.set_exception(e)
+            return
+
+        # DeleteObjects (multi-delete) is a POST to the bucket root with a
+        # ``?delete`` subresource and an XML body listing keys. Intercept before
+        # the per-key branch so it isn't treated as an object named "".
+        if (
+            method == "POST"
+            and operation_name == "DeleteObjects"
+            and path == "/?delete"
+        ):
+            request.body_stream.seek(0)
+            xml = bytes(request.body_stream.read())
+            keys = _parse_delete_request_keys(xml)
+            try:
+                with _BACKEND._lock:
+                    _BACKEND._delete_count += len(keys)
+                for k in keys:
+                    _BACKEND.delete(k)
+                if on_headers is not None:
+                    on_headers(200, [("content-type", "application/xml")])
+                # Quiet mode: empty DeleteResult body means every key succeeded.
+                if on_body is not None:
+                    on_body(
+                        b'<?xml version="1.0"?><DeleteResult '
+                        b'xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                        b"</DeleteResult>",
+                        0,
+                    )
                 if on_done is not None:
                     on_done(error=None, status_code=200)
                 self.finished_future.set_result(None)
@@ -542,6 +593,15 @@ class TestEviction:
         assert _BACKEND.contains(_object_key_to_string(key))
         adapter.delete([key])
         assert not _BACKEND.contains(_object_key_to_string(key))
+
+    def test_delete_batches_over_1000_keys(self, adapter):
+        # >1000 keys → multiple DeleteObjects requests; all must be removed.
+        keys = [create_object_key(i) for i in range(1500)]
+        for k in keys:
+            self._store(adapter, k, create_memory_obj())
+        adapter.delete(keys)
+        for k in keys:
+            assert not _BACKEND.contains(_object_key_to_string(k))
 
     def test_lock_blocks_delete(self, adapter):
         key = create_object_key(1)
@@ -900,3 +960,40 @@ class TestS3L2AdapterListKeys:
             page.entries[0].key
             == create_object_key(0, model_name="m").to_encoded_object_key()
         )
+
+
+# =============================================================================
+# DeleteObjects (multi-delete) helper unit tests
+# =============================================================================
+
+
+def test_build_delete_objects_body_quiet_and_escaped():
+    body = _build_delete_objects_body(["m@0@aa", "weird&<key>"])
+    assert b"<Quiet>true</Quiet>" in body
+    # ElementTree XML-escapes special chars in keys.
+    assert b"weird&amp;&lt;key&gt;" in body
+    assert _parse_delete_request_keys(body) == ["m@0@aa", "weird&<key>"]
+
+
+def test_parse_delete_objects_errors_empty_is_all_ok():
+    assert _parse_delete_objects_errors(b"") == set()
+    assert _parse_delete_objects_errors(b"   ") == set()
+
+
+def test_parse_delete_objects_errors_reports_failed_keys():
+    # Quiet-mode response with a namespace and one failed key.
+    resp = (
+        b'<?xml version="1.0"?><DeleteResult '
+        b'xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<Error><Key>m@1@bb</Key><Code>AccessDenied</Code></Error>"
+        b"</DeleteResult>"
+    )
+    assert _parse_delete_objects_errors(resp) == {"m@1@bb"}
+
+
+def test_parse_delete_objects_errors_malformed_raises():
+    # Standard
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        _parse_delete_objects_errors(b"<not-xml")
