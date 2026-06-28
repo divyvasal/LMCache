@@ -997,3 +997,63 @@ def test_parse_delete_objects_errors_malformed_raises():
 
     with _pytest.raises(ValueError):
         _parse_delete_objects_errors(b"<not-xml")
+
+
+# =============================================================================
+# A1 best-effort writes + A4 coalescing
+# =============================================================================
+
+
+def _store_and_drain(adapter, keys, objs):
+    adapter.submit_store_task(keys, objs)
+    wait_for_event_fd(adapter.get_store_event_fd())
+    adapter.pop_completed_store_tasks()
+
+
+def test_store_rejected_at_reject_watermark():
+    # cap 1 MB, reject at 0.8: one 1 MB object fills it; the next store is dropped
+    # (best-effort cache-miss) rather than written, bounding the overshoot.
+    config = S3L2AdapterConfig(
+        s3_endpoint="s3://test-bucket",
+        s3_region="us-east-1",
+        s3_prefer_http2=False,
+        s3_num_io_threads=1,
+        max_capacity_gb=0.001,  # 1 MiB
+        store_reject_watermark=0.8,
+    )
+    a = S3L2Adapter(config)
+    try:
+        k1 = create_object_key(1)
+        k2 = create_object_key(2)
+        _store_and_drain(a, [k1], [create_memory_obj(size=250_000)])  # ~1 MB → usage ~0.93
+        assert _BACKEND.contains(_object_key_to_string(k1))
+        # usage now >= 0.8 → k2 dropped, not written.
+        _store_and_drain(a, [k2], [create_memory_obj(size=250_000)])
+        assert not _BACKEND.contains(_object_key_to_string(k2))
+        assert a.report_status()["store_rejected_chunks"] >= 1
+    finally:
+        a.close()
+
+
+def test_store_coalesces_duplicate_keys():
+    # Same content-addressed key twice in one batch: the second is coalesced
+    # (single-flight), so the object is written once, not twice.
+    config = S3L2AdapterConfig(
+        s3_endpoint="s3://test-bucket",
+        s3_region="us-east-1",
+        s3_prefer_http2=False,
+        s3_num_io_threads=1,
+        max_capacity_gb=0.001,
+    )
+    a = S3L2Adapter(config)
+    try:
+        k = create_object_key(7)
+        _store_and_drain(
+            a, [k, k], [create_memory_obj(), create_memory_obj()]
+        )
+        assert _BACKEND.contains(_object_key_to_string(k))
+        assert a.report_status()["store_coalesced_chunks"] >= 1
+        # In-flight set is released after completion.
+        assert a.report_status()["store_in_flight_chunks"] == 0
+    finally:
+        a.close()

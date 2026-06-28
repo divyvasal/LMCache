@@ -392,6 +392,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
         max_capacity_gb: float = 0.0,
+        store_reject_watermark: float = 0.0,
     ):
         self.s3_endpoint = s3_endpoint
         self.s3_region = s3_region
@@ -402,6 +403,11 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.max_capacity_gb = max_capacity_gb
+        # Best-effort write ceiling: when usage_fraction reaches this, new stores
+        # are dropped (best-effort cache-miss) instead of written, so a write burst
+        # that outruns eviction can't push the tier far past the cap. 0.0 disables
+        # (legacy: stores always accepted, tier can overshoot until eviction catches up).
+        self.store_reject_watermark = store_reject_watermark
 
     @classmethod
     def from_dict(cls, d: dict) -> "S3L2AdapterConfig":
@@ -435,6 +441,11 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         max_cap = d.get("max_capacity_gb", 0.0)
         if not isinstance(max_cap, (int, float)) or isinstance(max_cap, bool):
             raise ValueError("max_capacity_gb must be a number")
+        reject_wm = d.get("store_reject_watermark", 0.0)
+        if not isinstance(reject_wm, (int, float)) or isinstance(reject_wm, bool):
+            raise ValueError("store_reject_watermark must be a number")
+        if reject_wm < 0.0:
+            raise ValueError("store_reject_watermark must be >= 0.0")
 
         cfg = cls(
             s3_endpoint=endpoint,
@@ -446,6 +457,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             aws_access_key_id=_opt_str("aws_access_key_id"),
             aws_secret_access_key=_opt_str("aws_secret_access_key"),
             max_capacity_gb=float(max_cap),
+            store_reject_watermark=float(reject_wm),
         )
         cfg.eviction_config = cls._parse_eviction_config(d)
         return cfg
@@ -565,6 +577,15 @@ class S3L2Adapter(L2AdapterInterface):
         # maintain a parallel total here.
         self._key_sizes: dict[ObjectKey, int] = {}
 
+        # Best-effort write ceiling (A1) + in-flight write coalescing (A4).
+        self._store_reject_watermark: float = config.store_reject_watermark
+        # Keys with an in-flight S3 PUT — used to single-flight concurrent stores
+        # of the same content-addressed chunk (the shared-prefix thundering herd).
+        self._in_flight_store_keys: set[ObjectKey] = set()
+        # Observability counters (surfaced via report_status / metrics).
+        self._store_rejected_chunks: int = 0
+        self._store_coalesced_chunks: int = 0
+
         # Cached HEAD-verified object sizes (keyed by S3 object name).
         self._object_size_cache: dict[str, int] = {}
 
@@ -623,16 +644,42 @@ class S3L2Adapter(L2AdapterInterface):
             self._next_task_id += 1
             if self._connection_disabled:
                 self._completed_store_tasks[task_id] = L2StoreResult(False, 0)
-                disabled = True
-            else:
-                disabled = False
+                self._store_efd.notify()
+                return task_id
 
-        if disabled:
-            self._store_efd.notify()
-            return task_id
+            # A1 best-effort write ceiling: when the tier is at/over the reject
+            # watermark, DROP the store instead of writing. A dropped chunk is a
+            # future cache-miss (recompute), never a block — so a write burst that
+            # outruns eviction can't push usage far past the cap (bounded overshoot).
+            if self._store_reject_watermark > 0.0:
+                usage = self.get_usage().usage_fraction
+                if usage >= self._store_reject_watermark:
+                    self._store_rejected_chunks += len(keys)
+                    self._completed_store_tasks[task_id] = L2StoreResult(False, 0)
+                    self._store_efd.notify()
+                    return task_id
+
+            # A4 single-flight: skip keys already mid-store (same content-addressed
+            # chunk in flight) so a shared-prefix thundering herd doesn't PUT the
+            # same object N times. Reserve the rest; _execute_store releases them.
+            filtered_keys: list[ObjectKey] = []
+            filtered_objects: list[MemoryObj] = []
+            for key, obj in zip(keys, objects, strict=True):
+                if key in self._in_flight_store_keys:
+                    self._store_coalesced_chunks += 1
+                    continue
+                self._in_flight_store_keys.add(key)
+                filtered_keys.append(key)
+                filtered_objects.append(obj)
+
+            if not filtered_keys:
+                # Everything coalesced into in-flight stores — nothing to write.
+                self._completed_store_tasks[task_id] = L2StoreResult(True, 0)
+                self._store_efd.notify()
+                return task_id
 
         asyncio.run_coroutine_threadsafe(
-            self._execute_store(list(keys), list(objects), task_id),
+            self._execute_store(filtered_keys, filtered_objects, task_id),
             self._loop,
         )
         return task_id
@@ -815,7 +862,18 @@ class S3L2Adapter(L2AdapterInterface):
         with self._lock:
             failures = self._connection_failures
             disabled = self._connection_disabled
+            rejected = self._store_rejected_chunks
+            coalesced = self._store_coalesced_chunks
+            in_flight = len(self._in_flight_store_keys)
         usage = self.get_usage()
+        # Eviction lag: how far usage sits over the cap (1.0). >0 means the evictor
+        # is behind the write rate; sustained high values flag the imbalance before
+        # it would otherwise pin/overshoot the cap.
+        eviction_lag = (
+            max(0.0, usage.usage_fraction - 1.0)
+            if usage.usage_fraction >= 0
+            else 0.0
+        )
         return {
             "is_healthy": self._loop_thread.is_alive() and not disabled,
             "type": "S3L2Adapter",
@@ -825,6 +883,11 @@ class S3L2Adapter(L2AdapterInterface):
             "connection_disabled": disabled,
             "current_size_bytes": usage.total_bytes_used,
             "max_capacity_bytes": usage.total_capacity_bytes,
+            # A5 observability: eviction lag + best-effort/coalescing activity.
+            "eviction_lag": eviction_lag,
+            "store_in_flight_chunks": in_flight,
+            "store_rejected_chunks": rejected,
+            "store_coalesced_chunks": coalesced,
         }
 
     def close(self) -> None:
@@ -1182,6 +1245,10 @@ class S3L2Adapter(L2AdapterInterface):
             self._completed_store_tasks[task_id] = L2StoreResult(
                 success, bytes_transferred
             )
+            # Release the in-flight reservations (A4) for every key this task
+            # owned — including launch-failed ones — so a later store can retry
+            # them rather than coalesce-skip forever.
+            self._in_flight_store_keys.difference_update(keys)
 
         if newly_stored_keys:
             self._notify_keys_stored(newly_stored_keys, newly_stored_sizes)
