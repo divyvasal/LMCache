@@ -228,6 +228,25 @@ class EvictionConfig:
     """ The fraction of *allocated* memory to evict when triggered (0.0 to 1.0).
     Used only when target_watermark is 0.0 (legacy fixed-ratio mode). """
 
+    def __post_init__(self) -> None:
+        if not 0.0 < self.trigger_watermark <= 1.0:
+            raise ValueError(
+                "trigger_watermark must be in (0.0, 1.0]; "
+                f"got {self.trigger_watermark}"
+            )
+        if self.target_watermark != 0.0 and not (
+            0.0 < self.target_watermark < self.trigger_watermark
+        ):
+            raise ValueError(
+                "target_watermark must be 0.0 (legacy fixed-ratio) or in "
+                f"(0.0, trigger_watermark={self.trigger_watermark}); "
+                f"got {self.target_watermark}"
+            )
+        if not 0.0 <= self.eviction_ratio <= 1.0:
+            raise ValueError(
+                f"eviction_ratio must be in [0.0, 1.0]; got {self.eviction_ratio}"
+            )
+
 
 @dataclass
 class StorageManagerConfig:

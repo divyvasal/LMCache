@@ -1039,7 +1039,9 @@ class S3L2Adapter(L2AdapterInterface):
         )
         return s3_req
 
-    def _delete_many_request(self, key_strs: list[str]):
+    def _delete_many_request(
+        self, key_strs: list[str]
+    ) -> tuple[s3.S3Request, list[bytes], dict[str, Optional[int]]]:
         """Build a single S3 ``DeleteObjects`` (multi-delete) request for up to
         ``DELETE_OBJECTS_MAX_KEYS`` keys — one round trip instead of one per key.
 
@@ -1183,76 +1185,83 @@ class S3L2Adapter(L2AdapterInterface):
         objects: list[MemoryObj],
         task_id: L2TaskId,
     ) -> None:
-        futures: list[Optional[asyncio.Future]] = []
-        indexed: list[tuple[int, ObjectKey, MemoryObj, Optional[str]]] = []
-        for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
-            try:
-                key_str = _object_key_to_string(key)
-                s3_req = self._put_request(key_str, obj)
-                futures.append(asyncio.wrap_future(s3_req.finished_future))
-                indexed.append((i, key, obj, key_str))
-            except Exception:
-                logger.exception("S3L2Adapter failed to launch PUT")
-                indexed.append((i, key, obj, None))
-                futures.append(None)
-
-        # Await all non-None futures.
-        results: list = []
-        real_futures = [f for f in futures if f is not None]
-        real_results = await asyncio.gather(*real_futures, return_exceptions=True)
-        real_iter = iter(real_results)
-        for f in futures:
-            if f is None:
-                results.append(RuntimeError("failed to launch S3 PUT"))
-            else:
-                results.append(next(real_iter))
-
-        success = True
-        # Track net-new keys for accounting notification. Same chunk_hash
-        # re-stored is identical content (content-addressed), so skipping
-        # re-notify here prevents the base class from double-counting
-        # bytes for the same object.
+        # Initialised before the try so the finally can ALWAYS run its cleanup — even if this
+        # coroutine is cancelled (shutdown/timeout) or raises before completing. Otherwise the
+        # keys would leak in ``_in_flight_store_keys`` (A4) and be coalesce-skipped forever.
+        success = False
+        bytes_transferred = 0
+        # Track net-new keys for accounting notification. Same chunk_hash re-stored is identical
+        # content (content-addressed), so skipping re-notify here prevents the base class from
+        # double-counting bytes for the same object.
         newly_stored_keys: list[ObjectKey] = []
         newly_stored_sizes: list[int] = []
-        last_error: Optional[str] = None
-        for indexed_entry, result in zip(indexed, results, strict=True):
-            i, key, obj, opt_key_str = indexed_entry
-            if isinstance(result, Exception):
-                success = False
-                last_error = str(result)
-                continue
-            # Use logical size (``get_size``) to match the number of
-            # bytes actually PUT to S3 via ``obj.byte_array`` — which
-            # excludes any alignment padding in the underlying buffer.
-            # ``get_physical_size`` would inflate ``total_bytes_used``
-            # relative to the on-wire payload and cause premature
-            # aggregate-watermark eviction. Matches the convention used
-            # by ``native_connector_l2_adapter`` and ``mock_l2_adapter``.
-            size = obj.get_size()
+        try:
+            futures: list[Optional[asyncio.Future]] = []
+            indexed: list[tuple[int, ObjectKey, MemoryObj, Optional[str]]] = []
+            for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
+                try:
+                    key_str = _object_key_to_string(key)
+                    s3_req = self._put_request(key_str, obj)
+                    futures.append(asyncio.wrap_future(s3_req.finished_future))
+                    indexed.append((i, key, obj, key_str))
+                except Exception:
+                    logger.exception("S3L2Adapter failed to launch PUT")
+                    indexed.append((i, key, obj, None))
+                    futures.append(None)
+
+            # Await all non-None futures.
+            results: list = []
+            real_futures = [f for f in futures if f is not None]
+            real_results = await asyncio.gather(*real_futures, return_exceptions=True)
+            real_iter = iter(real_results)
+            for f in futures:
+                if f is None:
+                    results.append(RuntimeError("failed to launch S3 PUT"))
+                else:
+                    results.append(next(real_iter))
+
+            success = True
+            last_error: Optional[str] = None
+            for indexed_entry, result in zip(indexed, results, strict=True):
+                i, key, obj, opt_key_str = indexed_entry
+                if isinstance(result, Exception):
+                    success = False
+                    last_error = str(result)
+                    continue
+                # Use logical size (``get_size``) to match the number of
+                # bytes actually PUT to S3 via ``obj.byte_array`` — which
+                # excludes any alignment padding in the underlying buffer.
+                # ``get_physical_size`` would inflate ``total_bytes_used``
+                # relative to the on-wire payload and cause premature
+                # aggregate-watermark eviction. Matches the convention used
+                # by ``native_connector_l2_adapter`` and ``mock_l2_adapter``.
+                size = obj.get_size()
+                with self._lock:
+                    is_new = key not in self._key_sizes
+                    self._key_sizes[key] = size
+                    if opt_key_str is not None:
+                        self._object_size_cache[opt_key_str] = size
+                if is_new:
+                    newly_stored_keys.append(key)
+                    newly_stored_sizes.append(size)
+
+            self._record_connection_outcome(last_error if not success else None)
+            bytes_transferred = sum(newly_stored_sizes)
+        except Exception:
+            logger.exception("S3L2Adapter unhandled exception in _execute_store")
+            success = False
+        finally:
             with self._lock:
-                is_new = key not in self._key_sizes
-                self._key_sizes[key] = size
-                if opt_key_str is not None:
-                    self._object_size_cache[opt_key_str] = size
-            if is_new:
-                newly_stored_keys.append(key)
-                newly_stored_sizes.append(size)
-
-        self._record_connection_outcome(last_error if not success else None)
-
-        bytes_transferred = sum(newly_stored_sizes)
-        with self._lock:
-            self._completed_store_tasks[task_id] = L2StoreResult(
-                success, bytes_transferred
-            )
-            # Release the in-flight reservations (A4) for every key this task
-            # owned — including launch-failed ones — so a later store can retry
-            # them rather than coalesce-skip forever.
-            self._in_flight_store_keys.difference_update(keys)
-
-        if newly_stored_keys:
-            self._notify_keys_stored(newly_stored_keys, newly_stored_sizes)
-        self._store_efd.notify()
+                self._completed_store_tasks[task_id] = L2StoreResult(
+                    success, bytes_transferred
+                )
+                # ALWAYS release the in-flight reservations (A4) for every key this task owned —
+                # including launch-failed ones and on cancel/error — so a later store can retry
+                # them rather than coalesce-skip forever.
+                self._in_flight_store_keys.difference_update(keys)
+            if newly_stored_keys:
+                self._notify_keys_stored(newly_stored_keys, newly_stored_sizes)
+            self._store_efd.notify()
 
     async def _execute_lookup(
         self,
