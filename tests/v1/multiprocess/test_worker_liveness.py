@@ -27,7 +27,11 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     ContextEntry,
     LMCacheDrivenTransferModule,
 )
-from lmcache.v1.multiprocess.modules.management import ManagementModule
+from lmcache.v1.multiprocess.modules.management import (
+    PING_HEALTHY,
+    PING_UNTRACKED,
+    ManagementModule,
+)
 from lmcache.v1.periodic_thread import PeriodicThreadRegistry
 
 
@@ -185,9 +189,11 @@ class _FakeTarget:
         self.to_reap: list[int] = []
         self.dropped: list[int] = []
         self.count = 0
+        self.known: set[int] = set()
 
-    def touch_instance(self, instance_id: int) -> None:
+    def touch_instance(self, instance_id: int) -> bool:
         self.touched.append(instance_id)
+        return instance_id in self.known
 
     def reap_stale_instances(
         self, reap_timeout_s: float, registration_grace_s: float
@@ -214,11 +220,25 @@ def _reset_periodic_registry():
 def test_management_ping_touches_targets() -> None:
     """ping refreshes every target for a real id; None is ignored."""
     target = _FakeTarget()
+    target.known = {42}
     mgmt = ManagementModule(MagicMock(), liveness_targets=[target])
 
-    assert mgmt.ping(42) is True
-    assert mgmt.ping(None) is True
+    assert mgmt.ping(42) == PING_HEALTHY
+    assert mgmt.ping(None) == PING_HEALTHY
     assert target.touched == [42]
+
+
+def test_management_ping_untracked_instance() -> None:
+    """A ping naming an id no target knows replies PING_UNTRACKED (still
+    truthy, so old clients that bool() the reply read healthy) — the worker
+    uses it to re-register after being reaped."""
+    target = _FakeTarget()
+    mgmt = ManagementModule(MagicMock(), liveness_targets=[target])
+
+    reply = mgmt.ping(99)
+    assert reply == PING_UNTRACKED
+    assert bool(reply) is True
+    assert target.touched == [99]
 
 
 def test_management_reaper_reaps_and_drops() -> None:
@@ -248,7 +268,7 @@ def test_management_reaper_disabled_when_timeout_zero() -> None:
         worker_reap_timeout_seconds=0.0,
     )
     assert mgmt._reaper is None
-    assert mgmt.ping(1) is True
+    assert mgmt.ping(None) == PING_HEALTHY
 
 
 def test_management_report_status_summarizes_liveness() -> None:
