@@ -282,7 +282,12 @@ def send_ping(
             liveness, or None for an untracked prober (scheduler adapter).
 
     Returns:
-        True if server is healthy, False on timeout or error.
+        The server's reply code: PING_HEALTHY (1 / True) when healthy and the
+        instance is tracked (or the sender is a prober); PING_UNTRACKED (2)
+        when the server is healthy but no longer tracks this instance ID (it
+        was reaped — the caller must re-register). Falsy (False/0) on timeout
+        or error. Old servers reply bool True — indistinguishable from
+        PING_HEALTHY by design.
     """
     try:
         future = send_lmcache_request(mq_client, RequestType.PING, [instance_id])
@@ -470,9 +475,10 @@ class HeartbeatThread(PeriodicThread):
         UNREGISTER must not re-register a ghost context.
         """
         was_healthy = self._health_event.is_set()
-        healthy = send_ping(
+        reply = send_ping(
             self._mq_client, timeout=self._interval, instance_id=self._instance_id
         )
+        healthy = bool(reply)
 
         if self.stop_requested:
             return ThreadRunSummary(
@@ -480,9 +486,21 @@ class HeartbeatThread(PeriodicThread):
                 message="stop requested; skipping health update",
             )
 
-        need_trigger_recover = (
-            healthy and not was_healthy and self._recover_callback is not None
+        # PING_UNTRACKED (2): the server is up but reaped this instance (idle
+        # reap, server-side registry loss, or a registration race). Waiting for
+        # an unhealthy->healthy edge would deadlock — the reply stays untracked
+        # until WE re-register — so fire the recover callback right now.
+        untracked = reply == 2 and self._instance_id is not None
+
+        need_trigger_recover = self._recover_callback is not None and (
+            untracked or (healthy and not was_healthy)
         )
+        if untracked:
+            logger.warning(
+                "LMCache server no longer tracks instance %s (reaped while "
+                "idle?) — re-registering KV caches",
+                self._instance_id,
+            )
 
         # Try to call recover callback
         if need_trigger_recover:
@@ -1258,6 +1276,12 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
         self._send_register_kv_caches_request(kv_caches)
+        # Start heartbeats NOW, not lazily on the first store/retrieve: an idle
+        # worker that registers and then serves no traffic would otherwise never
+        # ping, and the server's never-pinged grace reaps it — its S3 tier then
+        # fails ("No GPU context registered") until the container restarts.
+        # Observed fleet-wide 2026-07-07 (§35).
+        self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1306,14 +1330,16 @@ class LMCacheMPWorkerAdapter:
             ) from None
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first store/retrieve.
+        """Start the heartbeat thread once (idempotent).
 
-        The heartbeat starts healthy (the event was set at construction). A
-        live worker pings every interval, refreshing its server-side
-        ``last_seen``, so it is never reaped while alive -- no re-registration
-        is needed at startup, and the first store/retrieve is not gated. The
-        recover callback still re-registers on a genuine unhealthy->healthy
-        edge (server restart).
+        Called EAGERLY from register_kv_caches — a live worker pings every
+        interval from the moment it registers, so it is never reaped while
+        alive even if it serves no traffic (the lazy first-op start left idle
+        workers silent past the never-pinged grace; §35 2026-07-07). Also
+        called from the op paths as a belt-and-suspenders for adapters that
+        register through older entry points. The recover callback re-registers
+        on a genuine unhealthy->healthy edge (server restart) and on an
+        untracked ping reply (reaped while the server stayed up).
         """
         if self._heartbeat is not None:
             return

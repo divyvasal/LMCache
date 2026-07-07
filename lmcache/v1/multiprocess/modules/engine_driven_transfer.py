@@ -169,13 +169,16 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             self._engine_driven_contexts.clear()
             self._strategies.clear()
 
-    def touch_instance(self, instance_id: int) -> None:
+    def touch_instance(self, instance_id: int) -> bool:
         """Refresh the worker's last-seen time and mark it ping-proven.
 
         A no-op if the instance is not tracked.
 
         Args:
             instance_id: The worker instance ID.
+
+        Returns:
+            True if the instance is tracked here (touched), False otherwise.
         """
         now = time.monotonic()
         with self._lock:
@@ -183,6 +186,8 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
                 entry.has_liveness_signal = True
+                return True
+        return False
 
     def tracked_instance_count(self) -> int:
         """Return the number of currently registered non-GPU instances."""

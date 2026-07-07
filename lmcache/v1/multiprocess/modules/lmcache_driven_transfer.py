@@ -482,13 +482,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             return dict(self._cache_contexts)
 
-    def touch_instance(self, instance_id: int) -> None:
+    def touch_instance(self, instance_id: int) -> bool:
         """Refresh the worker's last-seen time and mark it ping-proven.
 
         A no-op if the instance is not tracked.
 
         Args:
             instance_id: The worker instance ID.
+
+        Returns:
+            True if the instance is tracked here (touched), False otherwise —
+            the ping path uses this to tell the worker it has been reaped and
+            must re-register (see ManagementModule.ping_liveness).
         """
         now = time.monotonic()
         with self._lock:
@@ -496,6 +501,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
                 entry.has_liveness_signal = True
+                return True
+        return False
 
     def tracked_instance_count(self) -> int:
         """Return the number of currently registered instances."""

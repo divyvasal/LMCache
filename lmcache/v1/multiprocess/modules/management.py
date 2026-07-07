@@ -26,6 +26,11 @@ from lmcache.v1.periodic_thread import (
 logger = init_logger(__name__)
 
 
+# PING reply codes. Both truthy on purpose: an old client bool()s the reply.
+PING_HEALTHY = 1
+PING_UNTRACKED = 2
+
+
 class ManagementModule:
     """Handles management and utility operations for the cache engine.
 
@@ -125,7 +130,7 @@ class ManagementModule:
         if self._reaper is not None:
             self._reaper.stop()
 
-    def ping(self, instance_id: int | None) -> bool:
+    def ping(self, instance_id: int | None) -> int:
         """Respond to a ping and refresh the sender's liveness.
 
         Args:
@@ -134,12 +139,23 @@ class ManagementModule:
                 worker's last-seen time is refreshed on every liveness target.
 
         Returns:
-            Always True.
+            PING_HEALTHY (1) when the sender is a prober or a tracked worker;
+            PING_UNTRACKED (2) when the sender named an instance ID no
+            liveness target knows — the transport is healthy but the worker
+            has been reaped (or never registered) and must re-register its
+            KV caches before stores/prefetches can succeed.
+
+            Both values are truthy, so an older client that treats the reply
+            as a bool still reads "healthy" (1 == True in Python).
         """
-        if instance_id is not None:
-            for target in self._liveness_targets:
-                target.touch_instance(instance_id)
-        return True
+        if instance_id is None:
+            return PING_HEALTHY
+        tracked = False
+        for target in self._liveness_targets:
+            # No short-circuit: every target that tracks the id must refresh.
+            if target.touch_instance(instance_id):
+                tracked = True
+        return PING_HEALTHY if tracked else PING_UNTRACKED
 
     def _reap_cycle(self) -> ThreadRunSummary:
         """Run one reaper scan: reap stale workers, drop mirrored state.
