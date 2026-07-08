@@ -45,13 +45,16 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Ping
         # Payload: [instance_id] -- the sender's worker instance ID, or None
         #   for an untracked prober (the scheduler adapter).
-        # Returns: bool - Always True
+        # Returns: int - PING_HEALTHY (1) tracked/prober, PING_UNTRACKED (2)
+        #   healthy transport but the named instance is no longer registered
+        #   (reaped) and must re-register. Both truthy: a client that bool()s
+        #   the reply still reads "healthy".
         # BLOCKING on the NORMAL pool: keeps PING off the MQ main loop (where a
         # slow SYNC REGISTER_KV_CACHE would stall it) and lets pool saturation
         # surface as worker degraded mode.
         "PING": ProtocolDefinition(
             payload_classes=[int | None],
-            response_class=bool,
+            response_class=int,
             handler_type=HandlerType.BLOCKING,
         ),
     }
