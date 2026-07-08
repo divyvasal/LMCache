@@ -319,6 +319,9 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
       header (path-style addressing is not supported).
     - s3_region (str, required): AWS region used for SigV4.
     - s3_num_io_threads (int): CRT IO threads.
+    - s3_target_throughput_gbps (float): CRT throughput target; unset the
+      client self-scales to ~5 Gb/s and small-object KV GET/PUT fan-out
+      never reaches NIC line rate. Default 100.
     - s3_prefer_http2 (bool): ALPN negotiate to HTTP/2.
     - s3_enable_s3express (bool): enable S3 Express signing.
     - disable_tls (bool): bypass TLS on the bucket data plane (for
@@ -337,6 +340,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         s3_endpoint: str,
         s3_region: str,
         s3_num_io_threads: int = 64,
+        s3_target_throughput_gbps: float = 100.0,
         s3_prefer_http2: bool = True,
         s3_enable_s3express: bool = False,
         disable_tls: bool = False,
@@ -347,6 +351,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         self.s3_endpoint = s3_endpoint
         self.s3_region = s3_region
         self.s3_num_io_threads = s3_num_io_threads
+        self.s3_target_throughput_gbps = s3_target_throughput_gbps
         self.s3_prefer_http2 = s3_prefer_http2
         self.s3_enable_s3express = s3_enable_s3express
         self.disable_tls = disable_tls
@@ -391,6 +396,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             s3_endpoint=endpoint,
             s3_region=region,
             s3_num_io_threads=_int("s3_num_io_threads", 64),
+            s3_target_throughput_gbps=float(_int("s3_target_throughput_gbps", 100)),
             s3_prefer_http2=_bool("s3_prefer_http2", True),
             s3_enable_s3express=_bool("s3_enable_s3express", False),
             disable_tls=_bool("disable_tls", False),
@@ -409,6 +415,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             "('s3://<bucket>.<host>' or '<bucket>.<host>')\n"
             "- s3_region (str, required): AWS region for SigV4\n"
             "- s3_num_io_threads (int): CRT IO threads (default 64)\n"
+            "- s3_target_throughput_gbps (int): CRT throughput target (default 100)\n"
             "- s3_prefer_http2 (bool): try HTTP/2 via ALPN (default true)\n"
             "- s3_enable_s3express (bool): S3 Express signing (default false)\n"
             "- disable_tls (bool): bypass TLS on the bucket data plane\n"
@@ -494,6 +501,7 @@ class S3L2Adapter(L2AdapterInterface):
             tls_connection_options=tls_opts,
             tls_mode=tls_mode,
             signing_config=signing_config,
+            throughput_target_gbps=config.s3_target_throughput_gbps,
         )
 
         # 3 distinct cross-platform notifiers for the L2 interface.
