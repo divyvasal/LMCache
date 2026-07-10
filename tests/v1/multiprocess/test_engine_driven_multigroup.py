@@ -52,7 +52,9 @@ def _group_metadata(chunk_tokens: int = 8) -> EngineDrivenContextMetadata:
     )
 
 
-def test_shm_strategy_multigroup_store_and_retrieve_roundtrip() -> None:
+def test_shm_strategy_multigroup_store_and_retrieve_roundtrip(
+    stub_native_storage_ops: Any,
+) -> None:
     """Per-group reserve on store; retrieve misses until every group commits."""
     # First Party
     from lmcache.v1.distributed.config import (
@@ -278,12 +280,19 @@ def test_register_payload_carries_group_layouts() -> None:
     ctx = EngineDrivenTransferContext()
     kv = {f"layer_{i}": torch.zeros(2, 6, 4, 2, 8) for i in range(3)}
 
+    # First Party
+    from lmcache.v1.multiprocess.protocols.engine import (
+        RegisterEngineDrivenContextResponse,
+    )
+
     sent: list[Any] = []
 
     def _send(_mq, _rt, args):
         sent.append(args[0])
         future = MagicMock()
-        future.result.return_value = MagicMock(shm_name="lmcache_l1_pool_x", pool_size=1)
+        future.result.return_value = RegisterEngineDrivenContextResponse(
+            shm_name="lmcache_l1_pool_x", pool_size=4096
+        )
         return future
 
     ctx.register(
