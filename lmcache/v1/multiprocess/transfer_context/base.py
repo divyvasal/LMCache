@@ -193,6 +193,33 @@ class EngineDrivenContext(ABC):
         """Commit retrieve. Pickle: no-op. Shm: release read locks."""
         ...
 
+    def prepare_store_grouped(
+        self, key: IPCCacheServerKey, instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int], list[int]] | None:
+        """Multi-group store prepare (SHM transport only).
+
+        Returns:
+            Parallel per-slot ``(tensors, chunk_indices, group_ids)`` lists,
+            ``([], [], [])`` when fully cached, or ``None`` on a malformed
+            response.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support multi-group transfers"
+        )
+
+    def prepare_retrieve_grouped(
+        self, key: IPCCacheServerKey, instance_id: int
+    ) -> tuple[list[torch.Tensor], list[int]] | None:
+        """Multi-group retrieve prepare (SHM transport only).
+
+        Returns:
+            Parallel per-slot ``(tensors, group_ids)`` lists, or ``None`` on
+            a miss.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support multi-group transfers"
+        )
+
     @abstractmethod
     def close(self) -> None:
         """Release any resources held by this context."""

@@ -624,6 +624,11 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_store()."
             )
 
+        if self._group_states:
+            return self._submit_store_multigroup(
+                key, instance_id, kv_caches, block_ids
+            )
+
         torch_dev.synchronize()
         result = self._engine_driven_context.prepare_store(key, instance_id)
         out_buffers, chunk_indices = result if result is not None else (None, None)
@@ -667,6 +672,11 @@ class EngineDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
 
+        if self._group_states:
+            return self._submit_retrieve_multigroup(
+                key, instance_id, kv_caches, block_ids, skip_first_n_tokens
+            )
+
         src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
         ok = src_buffers is not None
         if src_buffers is not None:
@@ -689,6 +699,108 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context.commit_retrieve(key, instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()
+        future.set_result(ok)
+        return future
+
+    def _group_slots(
+        self,
+        tensors: list[torch.Tensor],
+        per_slot_group_ids: list[int],
+        gid: int,
+        chunk_indices: "list[int] | None" = None,
+    ) -> "tuple[list[torch.Tensor], list[int] | None]":
+        """Select group ``gid``'s slot tensors (and chunk indices) in order."""
+        idxs = [i for i, g in enumerate(per_slot_group_ids) if g == gid]
+        picked = [tensors[i] for i in idxs]
+        if chunk_indices is None:
+            return picked, None
+        return picked, [chunk_indices[i] for i in idxs]
+
+    def _submit_store_multigroup(
+        self,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> MessagingFuture:
+        """Uniform-coverage store: gather every group's chunks into its slots."""
+        ctx = self._engine_driven_context
+        assert ctx is not None
+        future: MessagingFuture[bool] = MessagingFuture()
+        if len(block_ids) != len(self._group_states):
+            raise RuntimeError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._group_states)} registered groups"
+            )
+        torch_dev.synchronize()
+        result = ctx.prepare_store_grouped(key, instance_id)
+        if result is None:
+            future.set_result(False)
+            return future
+        tensors, chunk_indices, group_ids = result
+        if not tensors:
+            future.set_result(True)
+            return future
+        for gid, state in enumerate(self._group_states):
+            out_g, chunks_g = self._group_slots(
+                tensors, group_ids, gid, chunk_indices
+            )
+            if not out_g:
+                continue
+            gather_paged_kv_to_cpu(
+                {name: kv_caches[name] for name in state.layer_names},
+                block_ids[gid],
+                state.blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=state.engine_kv_format,
+                out=out_g,
+                chunk_indices=chunks_g,
+            )
+        # SHM writes are async device->CPU copies; complete them before commit.
+        torch_dev.synchronize()
+        ok = ctx.commit_store(key, instance_id, [])
+        future.set_result(ok)
+        return future
+
+    def _submit_retrieve_multigroup(
+        self,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        skip_first_n_tokens: int,
+    ) -> MessagingFuture:
+        """Uniform-coverage retrieve: scatter every group's chunks from its slots."""
+        ctx = self._engine_driven_context
+        assert ctx is not None
+        future: MessagingFuture[bool] = MessagingFuture()
+        if len(block_ids) != len(self._group_states):
+            raise RuntimeError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._group_states)} registered groups"
+            )
+        result = ctx.prepare_retrieve_grouped(key, instance_id)
+        ok = result is not None
+        if result is not None:
+            tensors, group_ids = result
+            try:
+                for gid, state in enumerate(self._group_states):
+                    src_g, _ = self._group_slots(tensors, group_ids, gid)
+                    scatter_cpu_to_paged_kv(
+                        {name: kv_caches[name] for name in state.layer_names},
+                        block_ids[gid],
+                        src_g,
+                        state.blocks_in_chunk,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=state.engine_kv_format,
+                    )
+            except (RuntimeError, ValueError, TypeError, IndexError):
+                logger.exception("Failed to scatter retrieved CPU context chunks")
+                ok = False
+            # Complete device writes before the server may reuse the slots.
+            torch_dev.synchronize()
+        ctx.commit_retrieve(key, instance_id)
         future.set_result(ok)
         return future
 
