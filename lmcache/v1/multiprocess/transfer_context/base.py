@@ -110,14 +110,18 @@ class EngineDrivenContextMetadata:
     """Non-GPU context layout metadata for non-CUDA workers.
 
     Attributes:
-        layout_desc: Memory layout descriptor used to interpret chunk payloads.
+        layout_desc: Memory layout descriptor used to interpret chunk payloads
+            (group 0's layout for multi-group workers).
         block_size: Number of tokens per paged block.
         use_mla: Whether the worker KV format is MLA.
+        group_layouts: Per-LMCache-group layouts for multi-group (hybrid-KV)
+            workers, in protocol group order. ``None`` means single-group.
     """
 
     layout_desc: MemoryLayoutDesc
     block_size: int
     use_mla: bool
+    group_layouts: "list[MemoryLayoutDesc] | None" = None
 
 
 class EngineDrivenContext(ABC):
