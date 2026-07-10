@@ -4,8 +4,9 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 import os
 
 # Third Party
@@ -16,7 +17,10 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints, is_mla
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    GroupLayout,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -32,6 +36,10 @@ from lmcache.v1.multiprocess.transfer_context.base import (
 )
 from lmcache.v1.platform import _registry as platform_registry
 from lmcache.v1.platform import get_device_spec
+
+if TYPE_CHECKING:
+    # First Party
+    import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
@@ -171,6 +179,25 @@ class IPCEvent(Protocol):
 
 
 SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], MessagingFuture]
+
+
+@dataclass
+class _GroupState:
+    """Worker-side per-LMCache-group transfer state (multi-group registration).
+
+    Attributes:
+        layer_names: KV cache dict keys belonging to this group, in group
+            layer order — selects the gather/scatter tensor subset.
+        engine_kv_format: Detected KV format for this group's tensors.
+        blocks_in_chunk: Paged blocks of THIS group per LMCache chunk
+            (``chunk_tokens / tokens_per_block``).
+        layout_desc: Chunk layout for this group's objects.
+    """
+
+    layer_names: list[str]
+    engine_kv_format: "lmc_ops.EngineKVFormat"
+    blocks_in_chunk: int
+    layout_desc: MemoryLayoutDesc
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -410,6 +437,7 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._group_states: list[_GroupState] = []
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -439,14 +467,12 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` is accepted to satisfy the base interface but
-        is currently a no-op: the non-GPU transfer path does not support
-        hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
+        With multiple ``engine_group_infos`` (hybrid-KV models), each group's
+        layers are described by their own layout and gathered/scattered with
+        that group's block-id list (uniform coverage: every group stores and
+        retrieves every chunk). Sliding-window groups and pickle transport
+        are rejected — see ``MULTIGROUP v1`` notes on the raise sites.
         """
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
         (
             block_size,
             num_layers,
@@ -458,15 +484,78 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_kv_format = engine_kv_format
 
         use_mla_flag = is_mla(engine_kv_format)
-        shape = (
-            torch.Size([num_layers, blocks_in_chunk * block_size, hidden_dim_size])
-            if use_mla_flag
-            else torch.Size(
-                [2, num_layers, blocks_in_chunk * block_size, hidden_dim_size]
+        chunk_tokens = blocks_in_chunk * block_size
+
+        group_layouts: list[GroupLayout] = []
+        group_states: list[_GroupState] = []
+        if len(engine_group_infos) > 1:
+            layer_names = list(kv_caches)
+            for gid, group in enumerate(engine_group_infos):
+                if group.sw_size_tokens >= 0:
+                    raise RuntimeError(
+                        "engine-driven multi-group transfer only supports "
+                        "uniform-coverage groups; group "
+                        f"{gid} is sliding-window "
+                        f"(sw_size_tokens={group.sw_size_tokens}). Run with "
+                        "a unified KV cache manager instead."
+                    )
+                subset = {
+                    layer_names[i]: kv_caches[layer_names[i]]
+                    for i in group.layer_indices
+                }
+                (
+                    g_block_size,
+                    g_num_layers,
+                    g_hidden,
+                    g_dtype_str,
+                    g_format,
+                ) = compute_kv_layout(subset, layout_hints=layout_hints)
+                tokens_per_block = group.tokens_per_block or g_block_size
+                if chunk_tokens % tokens_per_block != 0:
+                    raise RuntimeError(
+                        f"group {gid} tokens_per_block={tokens_per_block} does "
+                        f"not divide the chunk size ({chunk_tokens} tokens)"
+                    )
+                g_mla = is_mla(g_format)
+                g_shape = (
+                    torch.Size([g_num_layers, chunk_tokens, g_hidden])
+                    if g_mla
+                    else torch.Size([2, g_num_layers, chunk_tokens, g_hidden])
+                )
+                group_layouts.append(
+                    GroupLayout(
+                        num_layers=g_num_layers,
+                        hidden_dim_size=g_hidden,
+                        dtype_str=g_dtype_str,
+                        tokens_per_block=tokens_per_block,
+                    )
+                )
+                group_states.append(
+                    _GroupState(
+                        layer_names=[layer_names[i] for i in group.layer_indices],
+                        engine_kv_format=g_format,
+                        blocks_in_chunk=chunk_tokens // tokens_per_block,
+                        layout_desc=MemoryLayoutDesc(
+                            shapes=[g_shape],
+                            dtypes=[getattr(torch, g_dtype_str)],
+                        ),
+                    )
+                )
+            # Group 0's layout doubles as the legacy top-level layout so
+            # single-group readers of the payload keep working.
+            shape = group_states[0].layout_desc.shapes[0]
+            layout_desc = MemoryLayoutDesc(
+                shapes=[shape], dtypes=group_states[0].layout_desc.dtypes
             )
-        )
-        dtype = getattr(torch, dtype_str)
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        else:
+            shape = (
+                torch.Size([num_layers, chunk_tokens, hidden_dim_size])
+                if use_mla_flag
+                else torch.Size([2, num_layers, chunk_tokens, hidden_dim_size])
+            )
+            dtype = getattr(torch, dtype_str)
+            layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        self._group_states = group_states
 
         future = send_request(
             mq_client,
@@ -481,6 +570,7 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    group_layouts=group_layouts,
                 )
             ],
         )
@@ -504,10 +594,18 @@ class EngineDrivenTransferContext(TransferContext):
             pool_size=pool_size,
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
+        if self._group_states and supported_transfer_mode != "SHM":
+            raise RuntimeError(
+                "engine-driven multi-group transfer requires the SHM "
+                "transport, but the server returned no SHM pool (pickle "
+                "mode). Enable a non-lazy L1 pool on the MP server."
+            )
         logger.info(
-            "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
+            "Worker non-GPU transfer context registered "
+            "(instance_id=%d, mode=%s, groups=%d)",
             instance_id,
             supported_transfer_mode,
+            max(1, len(self._group_states)),
         )
 
     def submit_store(
