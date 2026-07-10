@@ -312,6 +312,15 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         """
         return self._ctx.resolve_obj_keys(key, list(range(num_groups)))
 
+    def _group_keys_for(
+        self, entry: "EngineDrivenContextEntry", key: IPCCacheServerKey
+    ) -> "list[list[ObjectKey]] | None":
+        """Group-major keys when ``entry`` registered multi-group, else None."""
+        layouts = entry.metadata.group_layouts
+        if not layouts or len(layouts) < 2:
+            return None
+        return self._resolve_obj_keys_by_group(key, len(layouts))
+
     def register_kv_cache_engine_driven_context(
         self,
         payload: RegisterEngineDrivenContextPayload,
@@ -466,6 +475,7 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             instance_id=instance_id,
             context=entry.metadata,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
+            group_keys=self._group_keys_for(entry, key),
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["store_start_time"] = time.perf_counter()
@@ -532,11 +542,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             ValueError: If no non-GPU context is registered for the given
                 instance ID.
         """
-        _, strategy = self._resolve_for_transfer(instance_id)
+        entry, strategy = self._resolve_for_transfer(instance_id)
         response = strategy.prepare_retrieve(
             key=key,
             instance_id=instance_id,
             resolve_obj_keys=self._resolve_single_group_obj_keys,
+            group_keys=self._group_keys_for(entry, key),
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
         session.extras["retrieve_start_time"] = time.perf_counter()
