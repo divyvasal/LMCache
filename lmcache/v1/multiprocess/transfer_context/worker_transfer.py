@@ -192,12 +192,19 @@ class _GroupState:
         blocks_in_chunk: Paged blocks of THIS group per LMCache chunk
             (``chunk_tokens / tokens_per_block``).
         layout_desc: Chunk layout for this group's objects.
+        tokens_per_block: Logical tokens per paged block (engine metadata).
+        slots_per_block: Physical slot rows per paged block (tensor shape).
+            Differs from ``tokens_per_block`` for compressed slot geometries
+            (glm IndexShare) — token counts must be converted to slot counts
+            before they meet the copy kernels.
     """
 
     layer_names: list[str]
     engine_kv_format: "lmc_ops.EngineKVFormat"
     blocks_in_chunk: int
     layout_desc: MemoryLayoutDesc
+    tokens_per_block: int = 0
+    slots_per_block: int = 0
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -516,11 +523,21 @@ class EngineDrivenTransferContext(TransferContext):
                         f"group {gid} tokens_per_block={tokens_per_block} does "
                         f"not divide the chunk size ({chunk_tokens} tokens)"
                     )
+                # Chunk buffers are sized in PHYSICAL slot rows, not logical
+                # tokens: the copy kernels move g_block_size rows (the tensor
+                # shape's block dimension) per engine block, and the chunk
+                # spans chunk_tokens/tokens_per_block engine blocks. For
+                # uncompressed groups slots == tokens; glm's IndexShare
+                # indexer compresses (tokens_per_block != slots_per_block),
+                # and sizing by chunk_tokens made every gathered chunk
+                # mismatch its SHM slot (§46: stores failed prepare→commit).
+                g_blocks_in_chunk = chunk_tokens // tokens_per_block
+                g_slots_per_chunk = g_blocks_in_chunk * g_block_size
                 g_mla = is_mla(g_format)
                 g_shape = (
-                    torch.Size([g_num_layers, chunk_tokens, g_hidden])
+                    torch.Size([g_num_layers, g_slots_per_chunk, g_hidden])
                     if g_mla
-                    else torch.Size([2, g_num_layers, chunk_tokens, g_hidden])
+                    else torch.Size([2, g_num_layers, g_slots_per_chunk, g_hidden])
                 )
                 group_layouts.append(
                     GroupLayout(
@@ -528,17 +545,20 @@ class EngineDrivenTransferContext(TransferContext):
                         hidden_dim_size=g_hidden,
                         dtype_str=g_dtype_str,
                         tokens_per_block=tokens_per_block,
+                        slots_per_chunk=g_slots_per_chunk,
                     )
                 )
                 group_states.append(
                     _GroupState(
                         layer_names=[layer_names[i] for i in group.layer_indices],
                         engine_kv_format=g_format,
-                        blocks_in_chunk=chunk_tokens // tokens_per_block,
+                        blocks_in_chunk=g_blocks_in_chunk,
                         layout_desc=MemoryLayoutDesc(
                             shapes=[g_shape],
                             dtypes=[getattr(torch, g_dtype_str)],
                         ),
+                        tokens_per_block=tokens_per_block,
+                        slots_per_block=g_block_size,
                     )
                 )
             # Group 0's layout doubles as the legacy top-level layout so
@@ -786,12 +806,23 @@ class EngineDrivenTransferContext(TransferContext):
             try:
                 for gid, state in enumerate(self._group_states):
                     src_g, _ = self._group_slots(tensors, group_ids, gid)
+                    # The scatter kernel counts in PHYSICAL slot rows (tensor
+                    # shape); the caller's skip is in logical tokens. Convert
+                    # per group — for compressed geometries (IndexShare) the
+                    # two differ. Retrieve skips are chunk-aligned and every
+                    # group's tokens_per_block divides chunk_tokens (enforced
+                    # at register), so the division below is exact.
+                    skip_g = skip_first_n_tokens
+                    if state.tokens_per_block and state.slots_per_block:
+                        skip_g = (
+                            skip_first_n_tokens // state.tokens_per_block
+                        ) * state.slots_per_block
                     scatter_cpu_to_paged_kv(
                         {name: kv_caches[name] for name in state.layer_names},
                         block_ids[gid],
                         src_g,
                         state.blocks_in_chunk,
-                        skip_first_n_tokens=skip_first_n_tokens,
+                        skip_first_n_tokens=skip_g,
                         layout_hints=self._layout_hints,
                         engine_kv_format=state.engine_kv_format,
                     )
