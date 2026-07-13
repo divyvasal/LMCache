@@ -130,12 +130,20 @@ class GroupLayout(msgspec.Struct):
         tokens_per_block: Tokens covered by one paged block of this group
             (``EngineGroupInfo.tokens_per_block``; falls back to the engine
             ``block_size`` when the engine reported ``0``).
+        slots_per_chunk: Physical CPU-slot rows one LMCache chunk occupies for
+            this group: ``(chunk_tokens / tokens_per_block) * slots_per_block``,
+            where ``slots_per_block`` is the block dimension of the group's
+            registered tensors. Equals ``chunk_tokens`` for uncompressed
+            groups; diverges for compressed slot geometries (e.g. glm's
+            IndexShare indexer, where ``tokens_per_block != slots_per_block``).
+            ``0`` (legacy senders) means "use the context chunk size".
     """
 
     num_layers: int
     hidden_dim_size: int
     dtype_str: str
     tokens_per_block: int
+    slots_per_chunk: int = 0
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):

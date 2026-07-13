@@ -379,13 +379,17 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                         f"Invalid group dtype_str '{gl.dtype_str}' in "
                         "engine-driven registration"
                     )
+                # Slot dimension is the group's PHYSICAL rows per chunk, not
+                # the logical token count: compressed geometries (IndexShare)
+                # gather fewer/more rows than tokens, and a chunk_size-sized
+                # slot mismatches the worker's gathered bytes (§46 glm store
+                # failures). 0 = legacy sender (uncompressed): use chunk_size.
+                g_slots = gl.slots_per_chunk or self._ctx.chunk_size
                 g_shape = (
-                    torch.Size(
-                        [gl.num_layers, self._ctx.chunk_size, gl.hidden_dim_size]
-                    )
+                    torch.Size([gl.num_layers, g_slots, gl.hidden_dim_size])
                     if payload.use_mla
                     else torch.Size(
-                        [2, gl.num_layers, self._ctx.chunk_size, gl.hidden_dim_size]
+                        [2, gl.num_layers, g_slots, gl.hidden_dim_size]
                     )
                 )
                 group_layouts.append(

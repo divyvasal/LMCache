@@ -318,3 +318,107 @@ def test_register_payload_carries_group_layouts() -> None:
     assert isinstance(payload.group_layouts[0], GroupLayout)
     assert len(ctx._group_states) == 2
     assert ctx._group_states[1].layer_names == ["layer_2"]
+
+
+def test_register_compressed_slot_geometry_group() -> None:
+    """IndexShare-style group: tokens_per_block != physical slots per block.
+
+    Group 1's tensors hold 2 physical slot rows per 4-token engine block, so a
+    2-block chunk must be sized 4 slot rows (not 8 tokens) on both the payload
+    (server SHM sizing) and the worker-side chunk layout.
+    """
+    ctx = EngineDrivenTransferContext()
+    # Format [2, NB, NH, BS, HS]: 6 blocks, 2 heads, BS slot rows, 8 head dim.
+    kv = {
+        "layer_0": torch.zeros(2, 6, 2, 4, 8),
+        "layer_1": torch.zeros(2, 6, 2, 4, 8),
+        "layer_idx": torch.zeros(2, 6, 2, 2, 8),  # 2 slots per 4-token block
+    }
+
+    # First Party
+    from lmcache.v1.multiprocess.protocols.engine import (
+        RegisterEngineDrivenContextResponse,
+    )
+
+    sent: list[Any] = []
+
+    def _send(_mq, _rt, args):
+        sent.append(args[0])
+        future = MagicMock()
+        future.result.return_value = RegisterEngineDrivenContextResponse(
+            shm_name="lmcache_l1_pool_x", pool_size=4096
+        )
+        return future
+
+    ctx.register(
+        instance_id=1,
+        kv_caches=kv,
+        model_name="m",
+        world_size=1,
+        blocks_in_chunk=2,
+        mq_client=MagicMock(),
+        mq_timeout=1.0,
+        send_request=_send,
+        engine_group_infos=[
+            EngineGroupInfo(
+                engine_group_id=0, layer_indices=(0, 1), tokens_per_block=4
+            ),
+            EngineGroupInfo(
+                engine_group_id=1, layer_indices=(2,), tokens_per_block=4
+            ),
+        ],
+    )
+    payload: RegisterEngineDrivenContextPayload = sent[0]
+    # Uncompressed group: slots == tokens (2 blocks x 4 slots).
+    assert payload.group_layouts[0].slots_per_chunk == 8
+    # Compressed group: 2 blocks x 2 physical slots.
+    assert payload.group_layouts[1].slots_per_chunk == 4
+    assert ctx._group_states[0].layout_desc.shapes[0][-2] == 8
+    assert ctx._group_states[1].layout_desc.shapes[0][-2] == 4
+    assert ctx._group_states[1].blocks_in_chunk == 2
+    assert ctx._group_states[1].tokens_per_block == 4
+    assert ctx._group_states[1].slots_per_block == 2
+
+
+def test_submit_retrieve_multigroup_converts_skip_to_slots(monkeypatch) -> None:
+    """Retrieve skip is given in tokens; compressed groups get it in slots."""
+    ctx = EngineDrivenTransferContext()
+    ctx._group_states = [
+        worker_transfer._GroupState(
+            layer_names=["layer_0"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=2,
+            layout_desc=MagicMock(),
+            tokens_per_block=4,
+            slots_per_block=4,
+        ),
+        worker_transfer._GroupState(
+            layer_names=["layer_idx"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=2,
+            layout_desc=MagicMock(),
+            tokens_per_block=4,
+            slots_per_block=2,
+        ),
+    ]
+    skips: list[int] = []
+
+    def _fake_scatter(_kv, _block_ids, _src, _blocks_in_chunk, **kwargs: Any):
+        skips.append(kwargs.get("skip_first_n_tokens"))
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", _fake_scatter)
+
+    class _FakeRetrieveCtx:
+        def prepare_retrieve_grouped(self, _key, _iid):
+            return [torch.zeros(1), torch.zeros(1)], [0, 1]
+
+        def commit_retrieve(self, _key, _iid):
+            return True
+
+    ctx._engine_driven_context = _FakeRetrieveCtx()
+    kv = {"layer_0": torch.zeros(1), "layer_idx": torch.zeros(1)}
+    future = ctx._submit_retrieve_multigroup("k", 1, kv, [[1, 2], [3, 4]], 8)
+    assert future.result(timeout=1) is True
+    # Uncompressed group: 8 tokens -> 8 slot rows. Compressed: 8 tokens over
+    # 4-token blocks = 2 blocks -> 2 x 2 physical slots = 4 rows.
+    assert skips == [8, 4]
