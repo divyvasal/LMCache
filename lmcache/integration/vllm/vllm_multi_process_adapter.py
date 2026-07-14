@@ -1260,6 +1260,15 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
         self._send_register_kv_caches_request(kv_caches)
+        # Start heartbeats AT registration, not lazily on first store/retrieve:
+        # an idle-after-boot worker (sleepstack primary waiting for traffic)
+        # otherwise never pings, the server reaps it at the registration grace
+        # (default 300s), and the first real store then blocks the engine's
+        # execute_model until the MQ timeout — observed as a wedged engine on
+        # the first H200 multi-model boot (pinged=False reap at 324s). With the
+        # heartbeat running, the recovery callback also re-registers after any
+        # server-side reap or restart.
+        self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
