@@ -43,6 +43,17 @@ class MPCoordinatorConfig:
             the MP servers' ``--hash-algorithm`` (default ``blake3``, which is
             self-contained; other algorithms require vLLM importable in the
             coordinator process).
+            of the quota (0.0 to 1.0). The high watermark of the hysteresis band.
+        target_watermark: Low watermark of the eviction hysteresis band. When set
+            above ``0.0`` (and below ``trigger_watermark``), a sweep that fires at
+            ``trigger_watermark`` evicts down to ``target_watermark * quota`` in one
+            pass instead of a fixed ``eviction_ratio`` — so headroom always exists
+            and eviction never falls behind a sustained write burst (the bursty
+            single-watermark behaviour pins usage at the cap under load). ``0.0``
+            (default) keeps the legacy fixed-ratio behaviour.
+        blend_chunk_size: Tokens per chunk for the global CacheBlend directory
+            (the match unit). Must equal the LMCache chunk size the blend servers
+            use, so the coordinator chunks published/queried tokens the same way.
         blend_probe_stride: Positions between match probes. With partial-fill
             reuse any offset is usable, so ``1`` (probe every offset) gives full
             recall; raise only to trade recall for coordinator CPU.
@@ -69,6 +80,8 @@ class MPCoordinatorConfig:
     trigger_watermark: float = 1.0
     chunk_size: int = 256
     hash_algorithm: str = "blake3"
+    target_watermark: float = 0.0
+    blend_chunk_size: int = 256
     blend_probe_stride: int = 1
     enable_startup_resync: bool = True
     resync_poll_interval: float = 1.0
@@ -93,6 +106,13 @@ class MPCoordinatorConfig:
         if not 0.0 < self.trigger_watermark <= 1.0:
             raise ValueError(
                 "trigger_watermark must be between 0.0 (exclusive) and 1.0"
+            )
+        if self.target_watermark != 0.0 and not (
+            0.0 < self.target_watermark < self.trigger_watermark
+        ):
+            raise ValueError(
+                "target_watermark must be in (0.0, trigger_watermark); "
+                "0.0 disables hysteresis (legacy fixed-ratio eviction)"
             )
         if self.resync_poll_interval <= 0:
             raise ValueError("resync_poll_interval must be positive")
@@ -154,6 +174,8 @@ class MPCoordinatorConfig:
             trigger_watermark=_num("TRIGGER_WATERMARK", cls.trigger_watermark, float),
             chunk_size=int(_num("CHUNK_SIZE", cls.chunk_size, int)),
             hash_algorithm=_str("HASH_ALGORITHM", cls.hash_algorithm),
+            target_watermark=_num("TARGET_WATERMARK", cls.target_watermark, float),
+            blend_chunk_size=int(_num("BLEND_CHUNK_SIZE", cls.blend_chunk_size, int)),
             blend_probe_stride=int(
                 _num("BLEND_PROBE_STRIDE", cls.blend_probe_stride, int)
             ),
