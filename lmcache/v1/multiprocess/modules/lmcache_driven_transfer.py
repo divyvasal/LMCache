@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from itertools import islice
 from typing import Generator, Sequence
+import os
 import threading
 import time
 
@@ -617,6 +618,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
+        # Store-admission watermark: at/above this L1 usage fraction new stores are
+        # REJECTED at entry (cheap no-op; a later request re-stores once eviction
+        # catches up). Without it a cold flood drives the allocator into a
+        # fail/retry storm at usage 1.00 while eviction loses the race
+        # (2026-07-20 gauntlet). 1.0 disables the gate.
+        self._store_reject_wm = float(
+            os.environ.get("LMCACHE_MP_STORE_REJECT_WM", "0.95")
+        )
+        self._store_rejects = 0
+        self._store_reject_last_warn = 0.0
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -995,6 +1006,27 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         ):
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
+
+            # Admission gate: reject stores outright under L1 memory pressure —
+            # the allocator must never be the backpressure mechanism.
+            if self._store_reject_wm < 1.0:
+                used_b, total_b = self._ctx.storage_manager.get_l1_memory_usage()
+                if total_b > 0 and used_b / total_b >= self._store_reject_wm:
+                    self._store_rejects += 1
+                    now_s = time.monotonic()
+                    if now_s - self._store_reject_last_warn > 5.0:
+                        self._store_reject_last_warn = now_s
+                        logger.warning(
+                            "L1 usage %.2f >= store-reject watermark %.2f — "
+                            "rejecting store for request_id=%s "
+                            "(%d rejects since start)",
+                            used_b / total_b,
+                            self._store_reject_wm,
+                            key.request_id,
+                            self._store_rejects,
+                        )
+                    event.record()
+                    return event.ipc_handle(), False
 
             # Fail closed: every LMCache group must have block IDs covering all
             # chunks. A short list (e.g. a caller/protocol bug) would otherwise

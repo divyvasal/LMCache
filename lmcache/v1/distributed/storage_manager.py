@@ -168,6 +168,12 @@ class StorageManager:
 
     # External APIs for serving engine integration code to call
     @enable_tracing()
+    def get_l1_memory_usage(self) -> tuple[int, int]:
+        """(used_bytes, total_bytes) of the L1 tier — the store-admission gate reads
+        this to reject new stores under memory pressure instead of letting the
+        allocator thrash (2026-07-20 gauntlet: allocation storm at usage 1.00)."""
+        return self._l1_manager.get_memory_usage()
+
     def reserve_write(
         self,
         keys: list[ObjectKey],
