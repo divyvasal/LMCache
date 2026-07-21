@@ -9,6 +9,8 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.multiprocess.membership_index import MembershipIndex
+from lmcache.v1.multiprocess.protocols.engine import MembershipSyncResponse
 from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchHandle,
@@ -142,6 +144,13 @@ class LookupModule:
 
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
+        # Residency-mirror feed: authoritative chunk-membership set + epochs,
+        # fed by L2 stored/deleted events (see membership_index.py).
+        self._membership = MembershipIndex()
+        try:
+            self._ctx.storage_manager.register_l2_listener(self._membership)
+        except Exception:  # noqa: BLE001 — mirror is advisory, never fail boot
+            logger.exception("membership index registration failed — mirror disabled")
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
         self._setup_metrics()
@@ -151,6 +160,13 @@ class LookupModule:
         """Return the shared engine context. Exposed for testing only."""
         return self._ctx
 
+    def membership_sync(self, client_epoch: int) -> MembershipSyncResponse:
+        """MEMBERSHIP_SYNC handler — worker-local residency mirror feed."""
+        epoch, is_snapshot, added, removed = self._membership.sync(client_epoch)
+        return MembershipSyncResponse(
+            epoch=epoch, is_snapshot=is_snapshot, added=added, removed=removed
+        )
+
     def get_handlers(self) -> list[HandlerSpec]:
         """Return handler specs for all request types this module serves.
 
@@ -159,6 +175,11 @@ class LookupModule:
         """
         return [
             HandlerSpec(RequestType.LOOKUP, self.lookup, ThreadPoolType.NORMAL),
+            HandlerSpec(
+                RequestType.MEMBERSHIP_SYNC,
+                self.membership_sync,
+                ThreadPoolType.NORMAL,
+            ),
             HandlerSpec(
                 RequestType.QUERY_PREFETCH_STATUS,
                 self.query_prefetch_status,

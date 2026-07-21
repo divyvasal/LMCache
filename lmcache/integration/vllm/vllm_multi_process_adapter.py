@@ -29,6 +29,8 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.membership_index import membership_entry
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transfer_context import (
     EngineDrivenTransferContext,
     TransferContext,
@@ -398,6 +400,56 @@ def _normalize_adapter_init_args(
     return int(legacy_block_size), strategy, mq_timeout
 
 
+class MembershipSyncThread(PeriodicThread):
+    """Periodically syncs the worker-local residency mirror from one server.
+
+    The mirror lets the scheduler adapter resolve COLD lookups to 0 without an
+    RPC (the convoy fix): entries are ``salt|chunk_hash`` bytes maintained by
+    the server's MembershipIndex. Advisory only — staleness can never produce
+    a wrong answer, only a lost hit (false negative) or one wasted RPC (false
+    positive).
+    """
+
+    def __init__(
+        self,
+        mq_client: MessageQueueClient,
+        entries: set,
+        state: dict,
+        lock: threading.Lock,
+        interval: float = 5.0,
+        timeout: float = 3.0,
+    ):
+        super().__init__(name="lmcache-membership-sync", interval=interval)
+        self._mq_client = mq_client
+        self._entries = entries
+        self._state = state  # {"epoch": int, "synced": bool}
+        self._lock = lock
+        self._timeout = timeout
+
+    def _execute(self) -> ThreadRunSummary:
+        try:
+            fut = send_lmcache_request(
+                self._mq_client,
+                RequestType.MEMBERSHIP_SYNC,
+                [self._state.get("epoch", 0)],
+            )
+            resp = fut.result(timeout=self._timeout)
+        except Exception:  # noqa: BLE001 — mirror sync is best-effort
+            return ThreadRunSummary(success=False, message="membership sync failed")
+        if resp is None:
+            return ThreadRunSummary(success=False, message="empty membership response")
+        with self._lock:
+            if resp.is_snapshot:
+                self._entries.clear()
+                self._entries.update(resp.added)
+            else:
+                self._entries.update(resp.added)
+                self._entries.difference_update(resp.removed)
+            self._state["epoch"] = resp.epoch
+            self._state["synced"] = True
+        return ThreadRunSummary(success=True)
+
+
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
 
@@ -667,6 +719,36 @@ class LMCacheMPSchedulerAdapter:
         self._heartbeats: dict[str, HeartbeatThread] = {}
         self._heartbeat_lock = threading.Lock()
 
+        # Worker-local residency mirror (convoy fix): resolve COLD lookups to 0
+        # without the blocking LOOKUP RPC. Entries: salt|chunk_hash bytes,
+        # synced from each server's MembershipIndex every few seconds. Gated by
+        # LMCACHE_MP_LOCAL_MEMBERSHIP (default on); until the FIRST successful
+        # sync per server the gate stays open (falls through to the RPC).
+        self._membership_enabled = (
+            os.environ.get("LMCACHE_MP_LOCAL_MEMBERSHIP", "1") == "1"
+        )
+        self._membership_lock = threading.Lock()
+        self._membership_entries: dict[str, set] = {
+            url: set() for url in self._server_urls
+        }
+        self._membership_state: dict[str, dict] = {
+            url: {"epoch": 0, "synced": False} for url in self._server_urls
+        }
+        self._membership_threads: dict[str, MembershipSyncThread] = {}
+        self._membership_declined: set[str] = set()  # request_ids resolved cold
+        self._mirror_hasher: TokenHasher | None = None
+        if self._membership_enabled:
+            try:
+                self._mirror_hasher = TokenHasher(
+                    chunk_size=self.lmcache_tokens_per_chunk,
+                    hash_algorithm=os.environ.get(
+                        "LMCACHE_MP_HASH_ALGORITHM", "blake3"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — mirror is advisory
+                logger.exception("mirror hasher init failed — membership gate off")
+                self._membership_enabled = False
+
     @property
     def world_size(self) -> int:
         """Get the kv world size."""
@@ -697,6 +779,18 @@ class LMCacheMPSchedulerAdapter:
                 )
                 hb.start()
                 self._heartbeats[url] = hb
+                if self._membership_enabled:
+                    ms = MembershipSyncThread(
+                        mq_client=client,
+                        entries=self._membership_entries[url],
+                        state=self._membership_state[url],
+                        lock=self._membership_lock,
+                        interval=float(
+                            os.environ.get("LMCACHE_MP_MEMBERSHIP_SYNC_S", "5")
+                        ),
+                    )
+                    ms.start()
+                    self._membership_threads[url] = ms
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -737,6 +831,42 @@ class LMCacheMPSchedulerAdapter:
         if request_id in self._pending_lookups:
             # Skip if there is already a lookup request
             return
+
+        if request_id in self._membership_declined:
+            # Mirror already resolved this request cold — check_lookup_result
+            # returns 0 for unknown ids; never re-hash on later scheduler steps.
+            return
+
+        # RESIDENCY MIRROR GATE (convoy fix): a request whose FIRST chunk is
+        # absent from every server's mirror cannot have any prefix hit (chunk
+        # hashes chain from the first). Resolve it to 0 locally — no RPC, no
+        # scheduler wait. Gate only trusts a mirror that has synced at least
+        # once; a stale mirror costs a lost hit or one wasted RPC, never a
+        # wrong answer.
+        if (
+            self._membership_enabled
+            and self._mirror_hasher is not None
+            and len(token_ids) >= self.lmcache_tokens_per_chunk
+        ):
+            with self._membership_lock:
+                all_synced = all(
+                    st["synced"] for st in self._membership_state.values()
+                )
+                if all_synced:
+                    try:
+                        first_hash = self._mirror_hasher.compute_chunk_hashes(
+                            token_ids[: self.lmcache_tokens_per_chunk]
+                        )[0]
+                    except Exception:  # noqa: BLE001
+                        first_hash = None
+                    if first_hash is not None:
+                        entry = membership_entry(cache_salt, first_hash)
+                        present = any(
+                            entry in es for es in self._membership_entries.values()
+                        )
+                        if not present:
+                            self._membership_declined.add(request_id)
+                            return
 
         aligned_end = (
             len(token_ids) // self.lmcache_tokens_per_chunk
@@ -910,9 +1040,15 @@ class LMCacheMPSchedulerAdapter:
         self._finished_lookup_results.pop(request_id, None)
         self._per_server_hits.pop(request_id, None)
         self._lookup_params.pop(request_id, None)
+        self._membership_declined.discard(request_id)
 
     def shutdown(self) -> None:
         """Shutdown the scheduler adapter and its resources."""
+        for t in getattr(self, "_membership_threads", {}).values():
+            try:
+                t.stop()
+            except Exception:  # noqa: BLE001
+                pass
         for client in self.mq_clients.values():
             client.close()
         with self._heartbeat_lock:
