@@ -49,6 +49,21 @@ class PrepareRetrieveResponse:
 
 
 @dataclass
+class MembershipSyncResponse:
+    """Response for MEMBERSHIP_SYNC — the worker-local residency mirror feed.
+
+    ``entries`` are ``salt|chunk_hash`` byte strings (membership_index.py).
+    ``is_snapshot`` True means ``added`` is the FULL set (client resets its
+    mirror); otherwise added/removed are deltas since the client's epoch.
+    """
+
+    epoch: int
+    is_snapshot: bool
+    added: list[bytes] = field(default_factory=list)
+    removed: list[bytes] = field(default_factory=list)
+
+
+@dataclass
 class RegisterEngineDrivenContextResponse:
     """Response for REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT."""
 
@@ -67,6 +82,7 @@ REQUEST_NAMES = [
     "WAIT_PREFETCH_STATUS",
     "QUERY_PREFETCH_LOOKUP_HITS",
     "FREE_LOOKUP_LOCKS",
+    "MEMBERSHIP_SYNC",
     "END_SESSION",
     "REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT",
     "UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT",
@@ -160,6 +176,15 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             payload_classes=[KeyType, int],
             response_class=None,
             handler_type=HandlerType.BLOCKING,
+        ),
+        # Worker-local residency mirror sync (see membership_index.py).
+        # Payload:
+        #   - client_epoch: int - the epoch the client's mirror is at (0 = new)
+        # Returns: MembershipSyncResponse - snapshot or deltas since epoch
+        "MEMBERSHIP_SYNC": ProtocolDefinition(
+            payload_classes=[int],
+            response_class=MembershipSyncResponse,
+            handler_type=HandlerType.SYNC,
         ),
         # Query the status of a prefetch job by request_id
         # Payload:
