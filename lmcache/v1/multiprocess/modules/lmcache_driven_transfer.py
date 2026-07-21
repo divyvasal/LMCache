@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from itertools import islice
 from typing import Generator, Sequence
+import functools
 import os
 import threading
 import time
@@ -604,6 +605,15 @@ class ContextEntry:
     world_size: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
+    # Transfer-vs-teardown guard: ``in_use`` counts store/retrieve operations
+    # currently holding this entry's cache_context; ``dead`` marks an entry
+    # removed from the registry (reap / unregister) whose release must wait
+    # for the last such operation. Closing the context mid-copy unmaps the
+    # IPC/SHM segments under an active tensor copy and the server dies with
+    # SIGSEGV in the copy kernel (observed 2026-07-21 on every engine
+    # death/restart under load). Both fields are guarded by the module lock.
+    in_use: int = 0
+    dead: bool = False
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -675,6 +685,85 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
             return entry
+
+    def checkout_context_entry(self, instance_id: int) -> ContextEntry | None:
+        """Like get_and_touch_context_entry, but pins the entry against release.
+
+        The caller MUST pair this with :meth:`checkin_context_entry` (via
+        try/finally) once its transfer no longer touches the entry's
+        cache_context. While pinned, reap/unregister defer the context
+        close instead of unmapping segments under the caller's copy.
+
+        Args:
+            instance_id: The worker instance ID.
+
+        Returns:
+            The pinned entry, or None if the instance is not tracked.
+        """
+        now = time.monotonic()
+        with self._lock:
+            entry = self._cache_contexts.get(instance_id)
+            if entry is None:
+                return None
+            entry.last_seen = now
+            entry.in_use += 1
+            return entry
+
+    def checkin_context_entry(self, entry: ContextEntry) -> None:
+        """Release a pin taken by :meth:`checkout_context_entry`.
+
+        The last checkin of a dead (reaped/unregistered) entry performs the
+        deferred context release.
+
+        Args:
+            entry: The entry returned by checkout_context_entry.
+        """
+        with self._lock:
+            entry.in_use -= 1
+            release_now = entry.dead and entry.in_use <= 0
+        if not release_now:
+            return
+        logger.info(
+            "Deferred release of instance context (model=%s) after last "
+            "in-flight transfer drained",
+            entry.model_name,
+        )
+        # Hand the sole reference to the release list — a lingering local
+        # binding would keep the entry alive through ipc_collect and the
+        # IPC segments would never unmap (LMCache#4014).
+        to_release = [entry]
+        del entry
+        self._release_entries(to_release)
+
+    def _retire_entries(self, entries: list[ContextEntry]) -> None:
+        """Mark removed entries dead; release the idle ones immediately.
+
+        Busy entries (in_use > 0) are released by the final
+        checkin_context_entry instead — closing them here would unmap
+        IPC/SHM segments under an in-flight tensor copy (SIGSEGV).
+
+        Args:
+            entries: Entries already popped from the registry. The list is
+                cleared before release so no binding pins a released entry.
+        """
+        idle: list[ContextEntry] = []
+        busy = 0
+        with self._lock:
+            for entry in entries:
+                entry.dead = True
+                if entry.in_use <= 0:
+                    idle.append(entry)
+                else:
+                    busy += 1
+            del entry
+            entries.clear()
+        if busy:
+            logger.warning(
+                "Deferring release of %d instance context(s) with in-flight "
+                "transfers; they close when the last transfer drains",
+                busy,
+            )
+        self._release_entries(idle)
 
     def context_entries_snapshot(self) -> dict[int, ContextEntry]:
         """Return a shallow copy of the registry for iteration or status.
@@ -750,7 +839,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if reaped:
             del e  # a bound name would pin the final entry (see _release_entries)
             reaped.clear()
-            self._release_entries(entries)
+            self._retire_entries(entries)
         return reaped_ids
 
     def _release_entries(self, entries: list[ContextEntry]) -> None:
@@ -840,7 +929,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             entries = list(self._cache_contexts.values())
             self._cache_contexts.clear()
-        self._release_entries(entries)
+        self._retire_entries(entries)
 
     def register_kv_cache(
         self,
@@ -935,11 +1024,35 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             return
 
         # No scalar binding: `popped` must stay the only reference so
-        # _release_entries' reclaim actually unmaps the IPC segments.
-        self._release_entries(popped)
+        # the release's reclaim actually unmaps the IPC segments.
+        self._retire_entries(popped)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
+    @staticmethod
+    def _pins_context_entry(fn):
+        """Pin the instance's context entry for the duration of ``fn``.
+
+        Reap/unregister during the call then defers the context close to the
+        checkin below instead of unmapping IPC/SHM segments under the
+        operation's tensor copies (SIGSEGV otherwise).
+        """
+
+        @functools.wraps(fn)
+        def wrapper(self, key, instance_id, *args, **kwargs):
+            entry = self.checkout_context_entry(instance_id)
+            if entry is None:
+                raise ValueError(
+                    f"No GPU context registered for instance ID {instance_id}"
+                )
+            try:
+                return fn(self, key, instance_id, *args, **kwargs)
+            finally:
+                self.checkin_context_entry(entry)
+
+        return wrapper
+
     @_lmcache_nvtx_annotate
+    @_pins_context_entry
     def store(
         self,
         key: IPCCacheServerKey,
@@ -1171,6 +1284,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return event.ipc_handle(), True
 
     @_lmcache_nvtx_annotate
+    @_pins_context_entry
     def retrieve(
         self,
         key: IPCCacheServerKey,
