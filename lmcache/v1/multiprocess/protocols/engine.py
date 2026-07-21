@@ -184,7 +184,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "MEMBERSHIP_SYNC": ProtocolDefinition(
             payload_classes=[int],
             response_class=MembershipSyncResponse,
-            handler_type=HandlerType.SYNC,
+            handler_type=HandlerType.BLOCKING,
         ),
         # Query the status of a prefetch job by request_id
         # Payload:
