@@ -48,7 +48,6 @@ class RequestType(enum.Enum):
     WAIT_PREFETCH_STATUS = enum.auto()
     QUERY_PREFETCH_LOOKUP_HITS = enum.auto()
     FREE_LOOKUP_LOCKS = enum.auto()
-    MEMBERSHIP_SYNC = enum.auto()
     END_SESSION = enum.auto()
     REGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT = enum.auto()
     UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT = enum.auto()
@@ -90,6 +89,13 @@ class RequestType(enum.Enum):
     P2P_LOOKUP_AND_LOCK = enum.auto()
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()
     P2P_UNLOCK_OBJECTS = enum.auto()
+
+    # ALWAYS APPEND NEW MEMBERS AT THE END: enum values are the wire protocol
+    # between engine clients and the MP server — inserting mid-enum renumbers
+    # every later member and breaks mixed-version interop (2026-07-21: a
+    # mid-enum MEMBERSHIP_SYNC shifted PING; dev15 clients vs dev17 server
+    # failed every request with "Payload count does not match expected count").
+    MEMBERSHIP_SYNC = enum.auto()
 
 
 @dataclass
