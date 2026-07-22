@@ -240,6 +240,11 @@ class LMCacheMPRequestTracker:
     # Main state
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
 
+    # True when the min-gain gate decided the external tier has nothing to
+    # offer this request (native cache covers all but the unique tail).
+    # Suppresses the store path as well as the lookup.
+    external_bypassed: bool = False
+
     cache_salt: str = ""
 
     def __init__(self, request: "Request"):
@@ -337,6 +342,9 @@ class LMCacheMPRequestMetadata:
         """
         Generate the store metadata for the current request tracker.
 
+        Returns None for external-bypassed requests: the only unstored
+        tokens are the request's unique tail, not worth a store round-trip.
+
         Args:
             tracker: The request tracker to generate the metadata from.
             lmcache_tokens_per_chunk: the number of tokens in a LMCache data chunk
@@ -345,6 +353,8 @@ class LMCacheMPRequestMetadata:
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
         """
+        if tracker.external_bypassed:
+            return None
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
         # always be a multiple of `lmcache_tokens_per_chunk`
@@ -657,6 +667,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            # Minimum external-cache gain (tokens) worth paying the server
+            # round-trip for. When vLLM's native prefix cache already covers
+            # all but less than this many tokens of the prompt, skip the
+            # external lookup AND the store for the request entirely: the
+            # only uncovered tokens are the request's unique tail, which the
+            # external tier can neither serve nor usefully retain. At high
+            # concurrency the per-request lookup/lock/free RPC chain plus
+            # the tail-chunk store otherwise dominates the scheduler loop
+            # (measured 6.23M -> 1.85M tok/s on a hot shared-prefix bench).
+            # 0 = disabled (legacy behavior).
+            self._min_lookup_gain_tokens = int(
+                vllm_config.kv_transfer_config.get_from_extra_config(
+                    "lmcache.mp.min_lookup_gain_tokens", 0
+                )
+            )
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
@@ -992,6 +1017,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         tracker = self._get_or_create_request_tracker(request)
         # TODO: support loading KV for preempted requests in the future
         if request.status == RequestStatus.PREEMPTED:
+            return 0, False
+
+        if (
+            self._min_lookup_gain_tokens > 0
+            and len(request.all_token_ids) - num_computed_tokens
+            < self._min_lookup_gain_tokens
+        ):
+            # Native cache already covers everything but the unique tail —
+            # the external tier has nothing worth the round-trip. Mark the
+            # tracker so the store path skips the tail chunks too.
+            tracker.external_bypassed = True
             return 0, False
 
         self.scheduler_adapter.maybe_submit_lookup_request(
