@@ -468,6 +468,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         s3_endpoint: str,
         s3_region: str,
         s3_num_io_threads: int = 64,
+        s3_num_clients: int = 1,
         s3_throughput_target_gbps: float = 0.0,
         s3_prefer_http2: bool = True,
         s3_enable_s3express: bool = False,
@@ -482,6 +483,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         self.s3_endpoint = s3_endpoint
         self.s3_region = s3_region
         self.s3_num_io_threads = s3_num_io_threads
+        self.s3_num_clients = s3_num_clients
         self.s3_throughput_target_gbps = s3_throughput_target_gbps
         self.s3_prefer_http2 = s3_prefer_http2
         self.s3_enable_s3express = s3_enable_s3express
@@ -530,6 +532,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             s3_endpoint=endpoint,
             s3_region=region,
             s3_num_io_threads=_int("s3_num_io_threads", 64),
+            s3_num_clients=_int("s3_num_clients", 1),
             s3_throughput_target_gbps=float(d.get("s3_throughput_target_gbps", 0.0)),
             s3_prefer_http2=_bool("s3_prefer_http2", True),
             s3_enable_s3express=_bool("s3_enable_s3express", False),
@@ -645,15 +648,24 @@ class S3L2Adapter(L2AdapterInterface):
         _client_kwargs = {}
         if config.s3_throughput_target_gbps > 0:
             _client_kwargs["throughput_target_gbps"] = config.s3_throughput_target_gbps
-        self._s3_client = s3.S3Client(
-            bootstrap=client_bootstrap,
-            region=self._region,
-            enable_s3express=self._enable_s3express,
-            tls_connection_options=tls_opts,
-            tls_mode=tls_mode,
-            signing_config=signing_config,
-            **_client_kwargs,
-        )
+        # Client SHARDING: the CRT throughput governor is per-client, so N
+        # clients at the (stable) library-default target multiply aggregate
+        # GET/PUT bandwidth without raising throughput_target_gbps — elevated
+        # targets SEGV the native layer under burst (2026-07-21, cores kept).
+        # Requests pick a client by stable key hash (_client_for).
+        self._s3_clients = [
+            s3.S3Client(
+                bootstrap=client_bootstrap,
+                region=self._region,
+                enable_s3express=self._enable_s3express,
+                tls_connection_options=tls_opts,
+                tls_mode=tls_mode,
+                signing_config=signing_config,
+                **_client_kwargs,
+            )
+            for _ in range(max(1, config.s3_num_clients))
+        ]
+        self._s3_client = self._s3_clients[0]
 
         # 3 distinct cross-platform notifiers for the L2 interface.
         self._store_efd = create_event_notifier()
@@ -1074,6 +1086,7 @@ class S3L2Adapter(L2AdapterInterface):
         # module with per-test fixtures) can pile up FDs and exhaust
         # ``ulimit -n`` on CI runners.
         self._s3_client = None
+        self._s3_clients = []
         self._credentials_provider = None
         logger.info("S3L2Adapter closed")
 
@@ -1100,6 +1113,12 @@ class S3L2Adapter(L2AdapterInterface):
             body_stream=body_stream,
         )
 
+    def _client_for(self, key_str: str) -> "s3.S3Client":
+        """Stable per-key client pick so a key's parts share one client."""
+        if len(self._s3_clients) == 1:
+            return self._s3_clients[0]
+        return self._s3_clients[hash(key_str) % len(self._s3_clients)]
+
     def _head_request(self, key_str: str):
         req = self._make_request("HEAD", key_str)
         captured = {"len": None, "status": None}
@@ -1114,7 +1133,7 @@ class S3L2Adapter(L2AdapterInterface):
                         pass
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._client_for(key_str),
             type=s3.S3RequestType.DEFAULT,
             request=req,
             operation_name="HeadObject",
@@ -1140,7 +1159,7 @@ class S3L2Adapter(L2AdapterInterface):
                 )
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._client_for(key_str),
             type=s3.S3RequestType.GET_OBJECT,
             request=req,
             on_body=on_body,
@@ -1172,7 +1191,7 @@ class S3L2Adapter(L2AdapterInterface):
                 )
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._client_for(key_str),
             type=s3.S3RequestType.PUT_OBJECT,
             request=req,
             on_done=on_done,
@@ -1197,7 +1216,7 @@ class S3L2Adapter(L2AdapterInterface):
                 )
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._client_for(key_str),
             type=s3.S3RequestType.DEFAULT,
             request=req,
             operation_name="DeleteObject",
@@ -1253,7 +1272,7 @@ class S3L2Adapter(L2AdapterInterface):
                 )
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._s3_clients[0],
             type=s3.S3RequestType.DEFAULT,
             request=req,
             operation_name="ListObjectsV2",
@@ -1576,7 +1595,7 @@ class S3L2Adapter(L2AdapterInterface):
             captured["error"] = error
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._s3_clients[0],
             type=s3.S3RequestType.DEFAULT,
             request=req,
             operation_name="GetObject",
@@ -1624,7 +1643,7 @@ class S3L2Adapter(L2AdapterInterface):
                 )
 
         s3_req = s3.S3Request(
-            client=self._s3_client,
+            client=self._s3_clients[0],
             type=s3.S3RequestType.PUT_OBJECT,
             request=req,
             on_done=on_done,
