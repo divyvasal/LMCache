@@ -1233,6 +1233,56 @@ class S3L2Adapter(L2AdapterInterface):
         )
         return s3_req
 
+    def _put_request_from_file(self, key_str: str, mem_obj: MemoryObj):
+        """Launch a PUT whose body the CRT reads from a staging file in C.
+
+        Mirror of the recv_filepath GET path: MemoryViewStream feeds the
+        body through python (GIL-bound, ~600 MB/s aggregate ceiling —
+        measured throttling engine throughput under store-heavy load).
+        Write the object once to tmpfs with a GIL-releasing buffer write,
+        then let the CRT stream the upload natively.
+
+        Returns:
+            (s3_request, staging_path); caller unlinks on completion via
+            the on_done hook below (best effort — orphans in the staging
+            dir die with the tmpfs).
+        """
+        staging_path = os.path.join(
+            self._recv_staging_dir,
+            f"lmcs3put_{os.getpid()}_{next(self._staging_counter)}",
+        )
+        with open(staging_path, "wb") as f:
+            f.write(mem_obj.byte_array)
+        req = self._make_request(
+            "PUT",
+            key_str,
+            extra_headers=[
+                ("Content-Length", str(len(mem_obj.byte_array))),
+                ("Content-Type", "application/octet-stream"),
+            ],
+        )
+
+        def on_done(error=None, status_code=None, **kwargs):
+            try:
+                os.unlink(staging_path)
+            except OSError:
+                pass
+            if error or status_code not in (200, 201):
+                raise RuntimeError(
+                    f"S3 PUT failed for {key_str}: {error or status_code}"
+                )
+
+        s3_req = s3.S3Request(
+            client=self._client_for(key_str),
+            type=s3.S3RequestType.PUT_OBJECT,
+            request=req,
+            send_filepath=staging_path,
+            on_done=on_done,
+            credential_provider=self._credentials_provider,
+            region=self._region,
+        )
+        return s3_req, staging_path
+
     def _put_request(self, key_str: str, mem_obj: MemoryObj):
         stream = MemoryViewStream(mem_obj.byte_array)
         total_len = len(stream)
@@ -1387,7 +1437,10 @@ class S3L2Adapter(L2AdapterInterface):
         for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
             try:
                 key_str = _object_key_to_string(key)
-                s3_req = self._put_request(key_str, obj)
+                if self._recv_via_file:
+                    s3_req, _staging = self._put_request_from_file(key_str, obj)
+                else:
+                    s3_req = self._put_request(key_str, obj)
                 futures.append(asyncio.wrap_future(s3_req.finished_future))
                 indexed.append((i, key, obj, key_str))
             except Exception:
