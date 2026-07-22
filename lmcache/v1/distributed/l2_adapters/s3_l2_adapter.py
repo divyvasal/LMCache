@@ -468,6 +468,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         s3_endpoint: str,
         s3_region: str,
         s3_num_io_threads: int = 64,
+        s3_throughput_target_gbps: float = 0.0,
         s3_prefer_http2: bool = True,
         s3_enable_s3express: bool = False,
         disable_tls: bool = False,
@@ -481,6 +482,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         self.s3_endpoint = s3_endpoint
         self.s3_region = s3_region
         self.s3_num_io_threads = s3_num_io_threads
+        self.s3_throughput_target_gbps = s3_throughput_target_gbps
         self.s3_prefer_http2 = s3_prefer_http2
         self.s3_enable_s3express = s3_enable_s3express
         self.disable_tls = disable_tls
@@ -528,6 +530,7 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             s3_endpoint=endpoint,
             s3_region=region,
             s3_num_io_threads=_int("s3_num_io_threads", 64),
+            s3_throughput_target_gbps=float(d.get("s3_throughput_target_gbps", 0.0)),
             s3_prefer_http2=_bool("s3_prefer_http2", True),
             s3_enable_s3express=_bool("s3_enable_s3express", False),
             disable_tls=_bool("disable_tls", False),
@@ -635,6 +638,13 @@ class S3L2Adapter(L2AdapterInterface):
             else s3.S3RequestTlsMode.ENABLED
         )
         logger.info("Initializing S3 client for S3L2Adapter")
+        # throughput_target_gbps sizes the CRT client's connection pool; the
+        # 10 Gbps library default caps aggregate GET throughput ~600 MB/s on
+        # 100 Gbps instances (48-request warm-start burst measured exactly
+        # that, 2026-07-21). 0.0 = keep the library default.
+        _client_kwargs = {}
+        if config.s3_throughput_target_gbps > 0:
+            _client_kwargs["throughput_target_gbps"] = config.s3_throughput_target_gbps
         self._s3_client = s3.S3Client(
             bootstrap=client_bootstrap,
             region=self._region,
@@ -642,6 +652,7 @@ class S3L2Adapter(L2AdapterInterface):
             tls_connection_options=tls_opts,
             tls_mode=tls_mode,
             signing_config=signing_config,
+            **_client_kwargs,
         )
 
         # 3 distinct cross-platform notifiers for the L2 interface.
