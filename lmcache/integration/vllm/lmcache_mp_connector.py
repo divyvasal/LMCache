@@ -796,6 +796,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
+        logger.info(
+            "start_load_kv: submitting %d retrieve(s): %s",
+            len(request_ids),
+            request_ids[:4],
+        )
         with torch_dev.stream(torch_dev.current_stream()):
             event = torch_dev.Event(interprocess=True)
             event.record()
@@ -1022,8 +1027,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         tracker.num_lmcache_hit_tokens = ret
 
         need_to_load = max(0, ret - num_computed_tokens)
-        logger.debug(
-            "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
+        logger.info(
+            "[req=%s] lookup hit: lmcache=%d vllm_computed=%d need_to_load=%d",
+            request.request_id,
+            ret,
+            num_computed_tokens,
+            need_to_load,
         )
         return need_to_load, need_to_load > 0
 
@@ -1279,7 +1288,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 group_tokens_per_block=self._group_tokens_per_block,
             )
             if r_metadata is not None:
+                logger.info(
+                    "[req=%s] retrieve op emitted: lmcache_hit=%d vllm_hit=%d",
+                    request_tracker.request_id,
+                    request_tracker.num_lmcache_hit_tokens,
+                    request_tracker.num_vllm_hit_tokens,
+                )
                 metadata.add_request_metadata(r_metadata)
+            else:
+                # A WAITING_FOR_LOAD tracker that yields no op would leave the
+                # scheduler parked in WAITING_FOR_REMOTE_KVS forever (nothing
+                # ever reports finished_recving). Surface it loudly — the
+                # worker adapter's dropped-retrieve path will recompute.
+                logger.warning(
+                    "[req=%s] WAITING_FOR_LOAD but no retrieve op "
+                    "(lmcache_hit=%d vllm_hit=%d state=%s) — dropping load, "
+                    "request must be unparked by the worker",
+                    request_tracker.request_id,
+                    request_tracker.num_lmcache_hit_tokens,
+                    request_tracker.num_vllm_hit_tokens,
+                    request_tracker.state,
+                )
             request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
