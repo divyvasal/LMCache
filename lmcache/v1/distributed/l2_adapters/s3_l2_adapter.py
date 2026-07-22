@@ -1845,6 +1845,17 @@ class S3L2Adapter(L2AdapterInterface):
         )
         return all_entries
 
+    def known_keys(self) -> list[tuple[ObjectKey, int]]:
+        """Snapshot of every L2 key this adapter currently tracks.
+
+        Includes startup-seeded keys, so a late-registered listener (e.g.
+        the MP membership index, constructed after the adapter) can
+        backfill inventory it missed. Sizes ride along for symmetric
+        on_l2_keys_stored fanout.
+        """
+        with self._lock:
+            return list(self._key_sizes.items())
+
     def _seed_policy_in_order(self, ordered: list[tuple[ObjectKey, int]]) -> int:
         """Seed usage + the eviction policy from keys in LRU order.
 

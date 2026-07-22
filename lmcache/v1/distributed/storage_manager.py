@@ -1012,7 +1012,14 @@ class StorageManager:
         """Register a listener on all current and future L2 adapters.
 
         The listener is recorded so that adapters added later via
-        :meth:`add_l2_adapter` receive it too.
+        :meth:`add_l2_adapter` receive it too. Adapters that already hold
+        inventory (startup bucket seed runs at adapter construction,
+        before module listeners exist) backfill it through a synthetic
+        on_l2_keys_stored so late listeners — the MP membership index in
+        particular — see the full L2 population, not just keys stored
+        after they attached. Without this, every server restart blanked
+        the membership mirror and the S3 tier silently degraded to
+        recompute until re-stored (observed 2026-07-22).
 
         Args:
             listener: The listener to register.
@@ -1021,6 +1028,20 @@ class StorageManager:
             self._registered_l2_listeners.append(listener)
             for adapter in self._l2_adapters.values():
                 adapter.register_listener(listener)
+                known = getattr(adapter, "known_keys", None)
+                if known is None:
+                    continue
+                try:
+                    inventory = known()
+                    if inventory:
+                        keys = [k for k, _sz in inventory]
+                        sizes = [sz for _k, sz in inventory]
+                        listener.on_l2_keys_stored(keys, sizes)
+                except Exception:
+                    logger.exception(
+                        "L2 inventory backfill to late listener failed; "
+                        "listener starts from live events only"
+                    )
 
     # Functions for debugging and testing
     def memcheck(self) -> bool:
