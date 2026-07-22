@@ -793,7 +793,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        logger.info(
+        logger.debug(
             "start_load_kv: submitting %d retrieve(s): %s",
             len(request_ids),
             request_ids[:4],
@@ -1024,7 +1024,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         tracker.num_lmcache_hit_tokens = ret
 
         need_to_load = max(0, ret - num_computed_tokens)
-        logger.info(
+        logger.debug(
             "[req=%s] lookup hit: lmcache=%d vllm_computed=%d need_to_load=%d",
             request.request_id,
             ret,
@@ -1285,7 +1285,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 group_tokens_per_block=self._group_tokens_per_block,
             )
             if r_metadata is not None:
-                logger.info(
+                logger.debug(
                     "[req=%s] retrieve op emitted: lmcache_hit=%d vllm_hit=%d",
                     request_tracker.request_id,
                     request_tracker.num_lmcache_hit_tokens,
