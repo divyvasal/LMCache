@@ -22,7 +22,9 @@ from urllib.parse import quote as url_quote
 from urllib.parse import urlencode
 import asyncio
 import ctypes
+import itertools
 import json
+import os
 import threading
 import xml.etree.ElementTree as ET
 
@@ -469,6 +471,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         s3_region: str,
         s3_num_io_threads: int = 64,
         s3_num_clients: int = 1,
+        s3_recv_via_file: bool = False,
+        s3_recv_staging_dir: str = "/dev/shm",
         s3_throughput_target_gbps: float = 0.0,
         s3_prefer_http2: bool = True,
         s3_enable_s3express: bool = False,
@@ -484,6 +488,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
         self.s3_region = s3_region
         self.s3_num_io_threads = s3_num_io_threads
         self.s3_num_clients = s3_num_clients
+        self.s3_recv_via_file = s3_recv_via_file
+        self.s3_recv_staging_dir = s3_recv_staging_dir
         self.s3_throughput_target_gbps = s3_throughput_target_gbps
         self.s3_prefer_http2 = s3_prefer_http2
         self.s3_enable_s3express = s3_enable_s3express
@@ -533,6 +539,8 @@ class S3L2AdapterConfig(L2AdapterConfigBase):
             s3_region=region,
             s3_num_io_threads=_int("s3_num_io_threads", 64),
             s3_num_clients=_int("s3_num_clients", 1),
+            s3_recv_via_file=_bool("s3_recv_via_file", False),
+            s3_recv_staging_dir=str(d.get("s3_recv_staging_dir", "/dev/shm")),
             s3_throughput_target_gbps=float(d.get("s3_throughput_target_gbps", 0.0)),
             s3_prefer_http2=_bool("s3_prefer_http2", True),
             s3_enable_s3express=_bool("s3_enable_s3express", False),
@@ -671,6 +679,10 @@ class S3L2Adapter(L2AdapterInterface):
         self._store_efd = create_event_notifier()
         self._lookup_efd = create_event_notifier()
         self._load_efd = create_event_notifier()
+
+        self._recv_via_file = bool(getattr(config, "s3_recv_via_file", False))
+        self._recv_staging_dir = getattr(config, "s3_recv_staging_dir", "/dev/shm")
+        self._staging_counter = itertools.count()
 
         self._next_task_id: L2TaskId = 0
         self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
@@ -1143,6 +1155,58 @@ class S3L2Adapter(L2AdapterInterface):
         )
         return s3_req, captured
 
+    def _get_request_to_file(self, key_str: str):
+        """Launch a GET whose body the CRT streams to a staging file in C.
+
+        The python on_body path enters the interpreter for every ~128 KB
+        part and serializes the whole data plane on the GIL (~600 MB/s
+        aggregate no matter how many clients). recv_filepath keeps the body
+        native; the caller drains the staging file into the L1 buffer with
+        a single GIL-releasing readinto per object.
+
+        Returns:
+            (s3_request, staging_path)
+        """
+        req = self._make_request("GET", key_str)
+        staging_path = os.path.join(
+            self._recv_staging_dir,
+            f"lmcs3_{os.getpid()}_{next(self._staging_counter)}",
+        )
+
+        def on_done(error=None, status_code=None, **kwargs):
+            ok = (status_code in (200, 206)) or (status_code is None and error is None)
+            if error or not ok:
+                raise RuntimeError(
+                    f"S3 GET failed for {key_str}: {error or status_code}"
+                )
+
+        s3_req = s3.S3Request(
+            client=self._client_for(key_str),
+            type=s3.S3RequestType.GET_OBJECT,
+            request=req,
+            recv_filepath=staging_path,
+            on_done=on_done,
+            credential_provider=self._credentials_provider,
+            region=self._region,
+        )
+        return s3_req, staging_path
+
+    @staticmethod
+    def _drain_staging_file(staging_path: str, mem_obj: MemoryObj) -> None:
+        """Copy a staged GET body into the L1 buffer and remove the file.
+
+        readinto() fills the MemoryObj's buffer directly from the page cache
+        (staging lives on tmpfs) and releases the GIL for the copy.
+        """
+        try:
+            with open(staging_path, "rb") as f:
+                f.readinto(mem_obj.byte_array)
+        finally:
+            try:
+                os.unlink(staging_path)
+            except OSError:
+                pass
+
     def _get_request(self, key_str: str, mem_obj: MemoryObj):
         req = self._make_request("GET", key_str)
         data_ptr = mem_obj.data_ptr
@@ -1473,11 +1537,16 @@ class S3L2Adapter(L2AdapterInterface):
         bitmap = Bitmap(len(keys))
         futures = []
         launched_indices = []
+        staging: dict[int, str] = {}
 
         for i, (key, obj) in enumerate(zip(keys, objects, strict=True)):
             try:
                 key_str = _object_key_to_string(key)
-                s3_req = self._get_request(key_str, obj)
+                if self._recv_via_file:
+                    s3_req, path = self._get_request_to_file(key_str)
+                    staging[i] = path
+                else:
+                    s3_req = self._get_request(key_str, obj)
                 futures.append(asyncio.wrap_future(s3_req.finished_future))
                 launched_indices.append(i)
             except Exception:
@@ -1487,12 +1556,39 @@ class S3L2Adapter(L2AdapterInterface):
         last_error: Optional[str] = None
         any_success = False
 
+        loop = asyncio.get_running_loop()
+        drains = []
+        drain_indices = []
         for idx, result in zip(launched_indices, results, strict=True):
             if isinstance(result, Exception):
                 last_error = str(result)
+                staged = staging.pop(idx, None)
+                if staged is not None:
+                    try:
+                        os.unlink(staged)
+                    except OSError:
+                        pass
                 continue
-            bitmap.set(idx)
-            any_success = True
+            staged = staging.pop(idx, None)
+            if staged is not None:
+                drains.append(
+                    loop.run_in_executor(
+                        None, self._drain_staging_file, staged, objects[idx]
+                    )
+                )
+                drain_indices.append(idx)
+            else:
+                bitmap.set(idx)
+                any_success = True
+
+        if drains:
+            drain_results = await asyncio.gather(*drains, return_exceptions=True)
+            for idx, dres in zip(drain_indices, drain_results, strict=True):
+                if isinstance(dres, Exception):
+                    last_error = str(dres)
+                    continue
+                bitmap.set(idx)
+                any_success = True
 
         if any_success:
             self._record_connection_outcome(None)
