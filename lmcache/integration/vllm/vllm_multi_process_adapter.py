@@ -1606,7 +1606,7 @@ class LMCacheMPWorkerAdapter:
             self.error_block_ids.update(op.flat_block_ids)
             self._dropped_retrieves.add(request_id)
             return
-        logger.info("[req=%s] retrieve submitting to server", request_id)
+        logger.debug("[req=%s] retrieve submitting to server", request_id)
 
         assert op.token_ids is not None
         key = self._create_key(
