@@ -1396,6 +1396,13 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         self.engine_group_infos = list(engine_group_infos)
         self._send_register_kv_caches_request(kv_caches)
+        # Start heartbeating IMMEDIATELY after registration, not lazily on
+        # first store/retrieve: model load + CUDA graph capture can take
+        # 15+ minutes, far past the server's registration grace, and a
+        # silent freshly-registered worker gets reaped before it serves —
+        # every later lookup/store then fails "No GPU context" and the S3
+        # tier silently degrades to recompute (2026-07-21).
+        self._ensure_heartbeat_started()
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
