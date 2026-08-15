@@ -263,6 +263,63 @@ def test_submit_store_multigroup_fans_out_per_group(monkeypatch) -> None:
     assert calls[1]["out"] == [t[2], t[3]]
 
 
+def test_submit_retrieve_multigroup_shm_keeps_last_aliasing_chunk(
+    monkeypatch,
+) -> None:
+    """The SHM grouped path applies the same last-snapshot rule as pickle."""
+    ctx, _ = _fanout_ctx(monkeypatch)
+    ctx._group_states = [
+        worker_transfer._GroupState(
+            layer_names=["layer_0", "layer_1"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            layout_desc=MagicMock(),
+        ),
+        worker_transfer._GroupState(
+            layer_names=["layer_2"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            layout_desc=MagicMock(),
+        ),
+    ]
+    payload = [
+        torch.tensor([0]),
+        torch.tensor([1]),
+        torch.tensor([2]),
+        torch.tensor([3]),
+        torch.tensor([4]),
+        torch.tensor([5]),
+    ]
+    ctx._engine_driven_context = _FakeGroupedContext(
+        payload, list(range(6)), [0, 0, 0, 1, 1, 1]
+    )  # type: ignore[assignment]
+    scattered: list[dict[str, Any]] = []
+
+    def _record_scatter(
+        _kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        chunks: list[torch.Tensor],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        scattered.append({"block_ids": block_ids, "chunks": chunks})
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", _record_scatter)
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, kv, [[0, 0, 0], [4, 5, 6]], MagicMock(), 1
+    )
+
+    assert future.result(timeout=1) is True
+    assert scattered[0]["block_ids"] == [0]
+    assert scattered[0]["chunks"] == payload[2:3]
+    assert scattered[1]["block_ids"] == [4, 5, 6]
+    assert scattered[1]["chunks"] == payload[3:]
+
+
 def test_submit_store_multigroup_group_count_mismatch(monkeypatch) -> None:
     ctx, _ = _fanout_ctx(monkeypatch)
     ctx._engine_driven_context = _FakeGroupedContext([], [], [])  # type: ignore[assignment]
@@ -398,6 +455,164 @@ def test_submit_retrieve_multigroup_pickle_scatters_group_major(
     assert [s["layers"] for s in scattered] == [["layer_0", "layer_1"], ["layer_2"]]
     assert scattered[0]["chunks"] is payload[0]
     assert scattered[1]["chunks"] is payload[1]
+
+
+def test_submit_retrieve_multigroup_pickle_keeps_last_aliasing_chunk(
+    monkeypatch,
+) -> None:
+    """Multiple logical snapshots targeting one physical recurrent-state block
+    must collapse to the newest snapshot before the H2D kernel is launched.
+
+    Mamba external hits represent earlier snapshots with the null block, so a
+    six-chunk hit can arrive as ``[0, 0, 0, 0, 0, 0]``. Launching them together
+    races six writes to block zero and produces a mixture of snapshots.
+    """
+    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    ctx._group_states = [
+        worker_transfer._GroupState(
+            layer_names=["layer_0", "layer_1"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            layout_desc=MagicMock(),
+        ),
+        worker_transfer._GroupState(
+            layer_names=["layer_2"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            layout_desc=MagicMock(),
+        ),
+    ]
+    payload = [
+        [torch.tensor([0]), torch.tensor([1]), torch.tensor([2])],
+        [torch.tensor([3]), torch.tensor([4]), torch.tensor([5])],
+    ]
+    monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", lambda _k, _i: payload)
+    scattered: list[dict[str, Any]] = []
+
+    def _record_scatter(
+        _kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        chunks: list[torch.Tensor],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        scattered.append({"block_ids": block_ids, "chunks": chunks})
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", _record_scatter)
+    kv = {name: torch.zeros(1) for name in ("layer_0", "layer_1", "layer_2")}
+
+    future = ctx.submit_retrieve(
+        "req", MagicMock(), 1, kv, [[0, 0, 0], [4, 5, 6]], MagicMock(), 1
+    )
+
+    assert future.result(timeout=1) is True
+    assert scattered[0]["block_ids"] == [0]
+    assert scattered[0]["chunks"] == payload[0][-1:]
+    assert scattered[1]["block_ids"] == [4, 5, 6]
+    assert scattered[1]["chunks"] is payload[1]
+
+
+def test_collapse_chunks_for_single_destination_policy() -> None:
+    """Collapse only a complete valid alias and preserve every other mapping."""
+    chunks = [torch.tensor([0]), torch.tensor([1]), torch.tensor([2])]
+
+    selected_chunks, selected_ids = (
+        worker_transfer._collapse_chunks_for_single_destination(
+            chunks,
+            [4, 5, 4, 5, 4, 5],
+            blocks_in_chunk=2,
+            blocks_per_window=2,
+        )
+    )
+    assert selected_chunks == chunks[-1:]
+    assert selected_ids == [4, 5]
+
+    cases = [
+        [0, 1, 2],  # unique full-attention destinations
+        [0, 0, 1],  # partial alias
+        [0, 0],  # incomplete block-ID mapping
+    ]
+    for block_ids in cases:
+        unchanged_chunks, unchanged_ids = (
+            worker_transfer._collapse_chunks_for_single_destination(
+                chunks,
+                block_ids,
+                blocks_in_chunk=1,
+                blocks_per_window=1,
+            )
+        )
+        assert unchanged_chunks is chunks
+        assert unchanged_ids is block_ids
+
+    skewed_ids = [0, 0, 0]
+    unchanged_chunks, unchanged_ids = (
+        worker_transfer._collapse_chunks_for_single_destination(
+            chunks,
+            skewed_ids,
+            blocks_in_chunk=2,
+            blocks_per_window=1,
+        )
+    )
+    assert unchanged_chunks is chunks
+    assert unchanged_ids is skewed_ids
+
+
+def test_submit_retrieve_multigroup_pickle_partial_skip_preserves_chunks(
+    monkeypatch,
+) -> None:
+    """Partial-token restores retain every source chunk and block mapping."""
+    ctx, pctx, _ = _pickle_worker_ctx(monkeypatch)
+    ctx._group_states = [
+        worker_transfer._GroupState(
+            layer_names=["layer_0"],
+            engine_kv_format=MagicMock(),
+            blocks_in_chunk=1,
+            blocks_per_window=1,
+            layout_desc=MagicMock(),
+        )
+    ]
+    payload = [[torch.tensor([0]), torch.tensor([1]), torch.tensor([2])]]
+    monkeypatch.setattr(pctx, "prepare_retrieve_multigroup", lambda _k, _i: payload)
+    scattered: list[dict[str, Any]] = []
+
+    def _record_scatter(
+        _kv_caches: dict[str, torch.Tensor],
+        block_ids: list[int],
+        chunks: list[torch.Tensor],
+        *_args: Any,
+        **kwargs: Any,
+    ) -> None:
+        scattered.append(
+            {
+                "block_ids": block_ids,
+                "chunks": chunks,
+                "skip_first_n_tokens": kwargs["skip_first_n_tokens"],
+            }
+        )
+
+    monkeypatch.setattr(worker_transfer, "scatter_cpu_to_paged_kv", _record_scatter)
+
+    future = ctx.submit_retrieve(
+        "req",
+        MagicMock(),
+        1,
+        {"layer_0": torch.zeros(1)},
+        [[0, 0, 0]],
+        MagicMock(),
+        1,
+        1,
+    )
+
+    assert future.result(timeout=1) is True
+    assert scattered == [
+        {
+            "block_ids": [0, 0, 0],
+            "chunks": payload[0],
+            "skip_first_n_tokens": 1,
+        }
+    ]
 
 
 def test_submit_retrieve_multigroup_pickle_group_count_mismatch(

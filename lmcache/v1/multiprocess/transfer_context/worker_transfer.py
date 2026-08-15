@@ -56,6 +56,44 @@ logger = init_logger(__name__)
 ENV_MP_TRANSFER_MODE = "LMCACHE_MP_TRANSFER_MODE"
 
 
+def _collapse_chunks_for_single_destination(
+    chunks: list[torch.Tensor],
+    block_ids: list[int],
+    blocks_in_chunk: int,
+    blocks_per_window: int,
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Keep only the newest snapshot when every chunk aliases one destination.
+
+    Mamba external hits contain null placeholders for historical states. The
+    resulting block-ID list can be ``[0, 0, ..., 0]`` even though every LMCache
+    object contains a different recurrent-state snapshot. Launching all objects
+    together races multiple H2D writes to block zero. When every chunk maps to
+    the same complete destination tuple, earlier writes are fully superseded,
+    so only the newest chunk is semantically observable.
+
+    Mixed or partial aliases are left unchanged; this helper only handles the
+    proven full-alias case without changing unique full-attention transfers.
+    """
+    num_chunks = len(chunks)
+    if (
+        num_chunks <= 1
+        or blocks_in_chunk != blocks_per_window
+        or len(block_ids) != num_chunks * blocks_per_window
+    ):
+        return chunks, block_ids
+
+    destinations = [
+        tuple(block_ids[i * blocks_per_window : (i + 1) * blocks_per_window])
+        for i in range(num_chunks)
+    ]
+    destination = destinations[0]
+    if not destination or any(ids != destination for ids in destinations[1:]):
+        return chunks, block_ids
+
+    last_start = (num_chunks - 1) * blocks_per_window
+    return chunks[-1:], block_ids[last_start : last_start + blocks_per_window]
+
+
 # Helper functions
 def _supports_async_primitives() -> bool:
     """Probe whether the worker device supports the async store primitives.
@@ -1076,10 +1114,30 @@ class EngineDrivenTransferContext(TransferContext):
         if group_chunks is not None:
             try:
                 for gid, state in enumerate(self._group_states):
+                    chunks = group_chunks[gid]
+                    group_block_ids = block_ids[gid]
+                    if skip_first_n_tokens == 0:
+                        compact_chunks, compact_block_ids = (
+                            _collapse_chunks_for_single_destination(
+                                chunks,
+                                group_block_ids,
+                                state.blocks_in_chunk,
+                                state.blocks_per_window,
+                            )
+                        )
+                        if len(compact_chunks) != len(chunks):
+                            logger.debug(
+                                "Collapsed %d aliased retrieve chunks to the "
+                                "newest snapshot for engine group %d",
+                                len(chunks),
+                                gid,
+                            )
+                        chunks = compact_chunks
+                        group_block_ids = compact_block_ids
                     scatter_cpu_to_paged_kv(
                         {name: kv_caches[name] for name in state.layer_names},
-                        block_ids[gid],
-                        group_chunks[gid],
+                        group_block_ids,
+                        chunks,
                         state.blocks_in_chunk,
                         skip_first_n_tokens=skip_first_n_tokens,
                         layout_hints=self._layout_hints,
@@ -1122,9 +1180,19 @@ class EngineDrivenTransferContext(TransferContext):
             try:
                 for gid, state in enumerate(self._group_states):
                     src_g, _ = self._group_slots(tensors, group_ids, gid)
+                    group_block_ids = block_ids[gid]
+                    if skip_first_n_tokens == 0:
+                        src_g, group_block_ids = (
+                            _collapse_chunks_for_single_destination(
+                                src_g,
+                                group_block_ids,
+                                state.blocks_in_chunk,
+                                state.blocks_per_window,
+                            )
+                        )
                     scatter_cpu_to_paged_kv(
                         {name: kv_caches[name] for name in state.layer_names},
-                        block_ids[gid],
+                        group_block_ids,
                         src_g,
                         state.blocks_in_chunk,
                         skip_first_n_tokens=skip_first_n_tokens,
